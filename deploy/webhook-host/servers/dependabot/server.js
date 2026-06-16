@@ -56,14 +56,13 @@ const CHECKOUTS_DIR = process.env.WEBHOOK_CHECKOUTS_DIR || '/.archon/checkouts';
 const TARGET_REPOS = new Set(
   (process.env.WEBHOOK_TARGET_REPOS || '')
     .split(/[\s,]+/)
-    .map((s) => s.trim().toLowerCase())
+    .map(s => s.trim().toLowerCase())
     .filter(Boolean)
 );
 // Legacy single-repo fallback: only used when no allowlist is configured.
 const ARCHON_WORKDIR = process.env.ARCHON_WORKDIR || '';
 const FROM_BRANCH = process.env.ARCHON_FROM_BRANCH || 'main';
-const LOG_DIR = process.env.WEBHOOK_LOG_DIR ||
-  path.join(__dirname, 'logs');
+const LOG_DIR = process.env.WEBHOOK_LOG_DIR || path.join(__dirname, 'logs');
 
 // Resolve the working directory (a git checkout) for an incoming repo.
 // Returns { dir } on success, or { error } when the repo isn't allowlisted or
@@ -111,11 +110,7 @@ function resolveSelfLogin() {
 }
 const SELF_LOGIN = resolveSelfLogin();
 
-const DEPENDABOT_LOGINS = new Set([
-  'dependabot[bot]',
-  'app/dependabot',
-  'dependabot',
-]);
+const DEPENDABOT_LOGINS = new Set(['dependabot[bot]', 'app/dependabot', 'dependabot']);
 const HANDLED_ACTIONS = new Set(['opened', 'reopened']);
 
 // Testing aid: when set, `reopened` events whose sender is this bot are NOT
@@ -124,14 +119,18 @@ const HANDLED_ACTIONS = new Set(['opened', 'reopened']);
 // is unaffected. Unset/remove this for normal operation.
 const ALLOW_SELF_REOPEN = process.env.WEBHOOK_ALLOW_SELF_REOPEN === '1';
 
-// Boot sweep: when set, on startup the server kicks off ONE pipeline run in
-// "all" mode, which sequentially processes every open Dependabot PR for the
-// target repo (the checkout at ARCHON_WORKDIR). Useful for catching PRs that
-// opened while the server was down. A single sequential run (not N concurrent
-// runs) avoids the per-codebase source-link contention. NOTE: this fires on
-// EVERY start, including launchd auto-restarts — leave off unless you want a
-// full sweep each boot.
-const SWEEP_ON_BOOT = process.env.WEBHOOK_SWEEP_ON_BOOT === '1';
+// Backlog discovery. On boot (and after every run completes), list open
+// Dependabot PRs per repo and enqueue any not yet handled — so PRs that opened
+// while the server was down, or while another PR was running, get picked up.
+// Default ON; set WEBHOOK_DISCOVER_ON_BOOT=0 to disable the boot scan.
+const DISCOVER_ON_BOOT = process.env.WEBHOOK_DISCOVER_ON_BOOT !== '0';
+
+// Durable dedup marker. After a run, if the PR is still OPEN (escalated to
+// human review / not auto-merged / failed), the server adds this label so
+// future discovery sweeps skip it permanently (across restarts). Merged PRs
+// close and drop out of `--state open` naturally. Remove the label by hand to
+// re-queue a PR.
+const PROCESSED_LABEL = process.env.WEBHOOK_PROCESSED_LABEL || 'archon-reviewed';
 
 function verifySignature(payload, signatureHeader) {
   if (!signatureHeader || typeof signatureHeader !== 'string') return false;
@@ -170,8 +169,7 @@ function reply(res, status, body) {
 // link — Archon's per-codebase source model can't isolate those.
 function clearStaleArchonSource(repoFullName) {
   if (!repoFullName || repoFullName === 'unknown') return;
-  const link = path.join(
-    os.homedir(), '.archon', 'workspaces', repoFullName, 'source');
+  const link = path.join(os.homedir(), '.archon', 'workspaces', repoFullName, 'source');
   try {
     if (fs.lstatSync(link).isSymbolicLink()) {
       fs.unlinkSync(link);
@@ -184,53 +182,169 @@ function clearStaleArchonSource(repoFullName) {
   }
 }
 
-// Resolve owner/repo of the checkout at `workdir`. Used by the boot sweep to
-// scope the source-link cleanup and for logging.
-function resolveTargetRepo(workdir) {
-  try {
-    const r = spawnSync(
-      'gh', ['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'],
-      { cwd: workdir, encoding: 'utf8', timeout: 5000 });
-    if (r.status === 0 && r.stdout) return r.stdout.trim();
-  } catch {
-    // gh missing/unauthed — caller logs and skips the sweep
+// ── Per-repo serial work queue ───────────────────────────────────────────────
+// Archon uses a single `source` symlink per codebase, so two pipeline runs for
+// the SAME repo cannot run concurrently (they contend over it). We serialize
+// per repo: one run at a time per repo, repos drain independently. Both
+// webhook deliveries and backlog discovery feed the same queue.
+//
+//   repoStates: repo(full_name) -> { dir, pending: [prNumbers], seen: Set, running: bool }
+const repoStates = new Map();
+
+function repoState(repo, dir) {
+  let s = repoStates.get(repo);
+  if (!s) {
+    s = { dir, pending: [], seen: new Set(), running: false };
+    repoStates.set(repo, s);
+  } else if (dir) {
+    s.dir = dir;
   }
-  return null;
+  return s;
 }
 
-// Spawn one detached `dependabot-pipeline` run in `workdir` (the target repo's
-// checkout). `argument` is what the workflow classifies — a PR number (single
-// PR) or "all" (sweep every open Dependabot PR). `label` names the branch/log.
-function triggerPipeline(argument, repoFullName, workdir, label) {
+// Add a PR to a repo's queue (deduped within the session) and kick the drain.
+function enqueue(repo, dir, pr) {
+  const s = repoState(repo, dir);
+  if (s.seen.has(pr)) return false;
+  s.seen.add(pr);
+  s.pending.push(pr);
+  console.log(`[${repo}] queued PR #${pr} (queue depth ${s.pending.length})`);
+  drain(repo);
+  return true;
+}
+
+// Run the next queued PR for a repo if none is currently running. On
+// completion: label the PR if it's still open, then re-discover (catching PRs
+// opened during the run) and drain the next.
+function drain(repo) {
+  const s = repoStates.get(repo);
+  if (!s || s.running || s.pending.length === 0) return;
+  s.running = true;
+  const pr = s.pending.shift();
+  const child = runPipeline(repo, s.dir, pr, `pr-${pr}`);
+  child.on('close', code => {
+    console.log(`[${repo}] PR #${pr} run exited (code ${code}); queue depth ${s.pending.length}`);
+    labelIfStillOpen(repo, pr);
+    s.running = false;
+    rediscover(repo, s.dir).finally(() => drain(repo));
+  });
+}
+
+// Spawn one `dependabot-pipeline` run in `workdir`. NOT detached — we track
+// completion to serialize the queue and re-discover afterward.
+function runPipeline(repo, workdir, argument, label) {
   // Clear the prior run's source registration so Archon re-registers this
   // run's worktree without a symlink conflict.
-  clearStaleArchonSource(repoFullName);
+  clearStaleArchonSource(repo);
 
   const slug = label || `pr-${argument}`;
   const branch = `webhook/pipeline-${slug}-${Date.now()}`;
   const args = [
-    'workflow', 'run', 'dependabot-pipeline',
-    '--branch', branch,
-    '--from', FROM_BRANCH,
+    'workflow',
+    'run',
+    'dependabot-pipeline',
+    '--branch',
+    branch,
+    '--from',
+    FROM_BRANCH,
     String(argument),
   ];
-  // One log file per spawned run; safe filename (no slashes) and easy to tail.
   const logFile = path.join(LOG_DIR, branch.replace(/\//g, '_') + '.log');
   const logFd = fs.openSync(logFile, 'a');
-  fs.writeSync(logFd,
+  fs.writeSync(
+    logFd,
     `\n=== ${new Date().toISOString()} ` +
-    `[${repoFullName}] ${slug} (cwd ${workdir}) → archon ${args.join(' ')} ===\n`);
+      `[${repo}] ${slug} (cwd ${workdir}) → archon ${args.join(' ')} ===\n`
+  );
 
-  console.log(`[${repoFullName}] ${slug}: spawning (cwd ${workdir}) archon ${args.join(' ')}`);
+  console.log(`[${repo}] ${slug}: spawning (cwd ${workdir}) archon ${args.join(' ')}`);
   console.log(`  log: ${logFile}`);
 
-  const child = spawn('archon', args, {
+  return spawn('archon', args, {
     cwd: workdir,
-    detached: true,
     stdio: ['ignore', logFd, logFd],
   });
-  child.unref();
-  return { branch, logFile };
+}
+
+// After a run, if the PR is still OPEN it wasn't auto-merged (escalated to
+// human review / failed). Label it so discovery skips it permanently. Merged
+// PRs are CLOSED and drop out of `--state open` on their own.
+function labelIfStillOpen(repo, pr) {
+  try {
+    const v = spawnSync(
+      'gh',
+      ['pr', 'view', String(pr), '--repo', repo, '--json', 'state', '-q', '.state'],
+      { encoding: 'utf8', timeout: 10000 }
+    );
+    if ((v.stdout || '').trim() !== 'OPEN') return;
+    // Ensure the label exists (idempotent), then add it.
+    spawnSync(
+      'gh',
+      [
+        'label',
+        'create',
+        PROCESSED_LABEL,
+        '--repo',
+        repo,
+        '--color',
+        'FBCA04',
+        '--description',
+        'Handled by the Archon dependabot pipeline; needs human review',
+      ],
+      { timeout: 10000 }
+    );
+    spawnSync('gh', ['pr', 'edit', String(pr), '--repo', repo, '--add-label', PROCESSED_LABEL], {
+      timeout: 10000,
+    });
+    console.log(`[${repo}] PR #${pr} still open after run → labeled '${PROCESSED_LABEL}'`);
+  } catch (err) {
+    console.warn(`[${repo}] could not label PR #${pr}: ${err.message}`);
+  }
+}
+
+// List open Dependabot PRs for a repo that lack the processed label, and
+// enqueue any not already seen this session. Resolves when done (best effort).
+function rediscover(repo, workdir) {
+  return new Promise(resolve => {
+    let out = '';
+    const child = spawn(
+      'gh',
+      [
+        'pr',
+        'list',
+        '--repo',
+        repo,
+        '--author',
+        'app/dependabot',
+        '--state',
+        'open',
+        '--json',
+        'number,labels',
+        '--limit',
+        '100',
+      ],
+      { stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+    child.stdout.on('data', d => {
+      out += d;
+    });
+    child.on('error', () => resolve());
+    child.on('close', () => {
+      try {
+        const prs = JSON.parse(out || '[]');
+        let added = 0;
+        for (const p of prs) {
+          const labeled = (p.labels || []).some(l => l.name === PROCESSED_LABEL);
+          if (labeled) continue;
+          if (enqueue(repo, workdir, p.number)) added++;
+        }
+        if (added) console.log(`[${repo}] discovery enqueued ${added} new PR(s)`);
+      } catch (err) {
+        console.warn(`[${repo}] discovery parse failed: ${err.message}`);
+      }
+      resolve();
+    });
+  });
 }
 
 const server = http.createServer((req, res) => {
@@ -242,7 +356,7 @@ const server = http.createServer((req, res) => {
   }
 
   const chunks = [];
-  req.on('data', (chunk) => chunks.push(chunk));
+  req.on('data', chunk => chunks.push(chunk));
   req.on('end', () => {
     const raw = Buffer.concat(chunks);
 
@@ -288,12 +402,14 @@ const server = http.createServer((req, res) => {
     if (selfReopenAllowed && sender === SELF_LOGIN) {
       console.log(
         `[${repo}] PR #${pr && pr.number}: sender '${sender}' is this bot but ` +
-        `WEBHOOK_ALLOW_SELF_REOPEN=1 — not suppressing reopened event (testing)`);
+          `WEBHOOK_ALLOW_SELF_REOPEN=1 — not suppressing reopened event (testing)`
+      );
     }
     if (SELF_LOGIN && sender === SELF_LOGIN && !selfReopenAllowed) {
       console.log(
         `[${repo}] PR #${pr && pr.number}: sender '${sender}' is this bot — ` +
-        `suppressing self-induced ${action} event`);
+          `suppressing self-induced ${action} event`
+      );
       return reply(res, 200, {
         ignored: true,
         reason: 'self_triggered_event',
@@ -304,7 +420,9 @@ const server = http.createServer((req, res) => {
 
     const author = pr && pr.user && pr.user.login;
     if (!DEPENDABOT_LOGINS.has(author)) {
-      console.log(`[${repo}] PR #${pr && pr.number}: author '${author}' is not Dependabot — ignoring`);
+      console.log(
+        `[${repo}] PR #${pr && pr.number}: author '${author}' is not Dependabot — ignoring`
+      );
       return reply(res, 200, { ignored: true, reason: 'not_dependabot', author });
     }
 
@@ -316,19 +434,20 @@ const server = http.createServer((req, res) => {
       return reply(res, 200, { ignored: true, reason: resolved.error, repo });
     }
 
-    const { branch, logFile } = triggerPipeline(pr.number, repo, resolved.dir);
+    // Enqueue onto the repo's serial queue (deduped). The queue drains one run
+    // at a time per repo and re-discovers the backlog after each completes.
+    const queued = enqueue(repo, resolved.dir, pr.number);
     return reply(res, 202, {
       accepted: true,
+      queued,
       pr: pr.number,
       title: pr.title,
       repo,
       action,
-      branch,
-      log_file: logFile,
     });
   });
 
-  req.on('error', (err) => {
+  req.on('error', err => {
     console.error('Request error:', err.message);
     reply(res, 500, { error: 'request_error' });
   });
@@ -336,7 +455,10 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, BIND_HOST, () => {
   console.log(`dependabot-webhook listening on http://${BIND_HOST}:${PORT}`);
-  const repoList = TARGET_REPOS.size > 0 ? [...TARGET_REPOS].join(', ') : `(none — fallback ${ARCHON_WORKDIR || 'unset'})`;
+  const repoList =
+    TARGET_REPOS.size > 0
+      ? [...TARGET_REPOS].join(', ')
+      : `(none — fallback ${ARCHON_WORKDIR || 'unset'})`;
   console.log(`  target repos:      ${repoList}`);
   console.log(`  checkouts dir:     ${CHECKOUTS_DIR}`);
   console.log(`  --from branch:     ${FROM_BRANCH}`);
@@ -344,30 +466,33 @@ server.listen(PORT, BIND_HOST, () => {
   if (SELF_LOGIN) {
     console.log(`  self login:        ${SELF_LOGIN} (events from this user will be suppressed)`);
   } else {
-    console.log(`  self login:        (unresolved — set WEBHOOK_BOT_LOGIN to enable self-event suppression)`);
+    console.log(
+      `  self login:        (unresolved — set WEBHOOK_BOT_LOGIN to enable self-event suppression)`
+    );
   }
   if (ALLOW_SELF_REOPEN) {
-    console.log(`  self-reopen:       ALLOWED (WEBHOOK_ALLOW_SELF_REOPEN=1 — testing; reopened events from self are NOT suppressed)`);
+    console.log(
+      `  self-reopen:       ALLOWED (WEBHOOK_ALLOW_SELF_REOPEN=1 — testing; reopened events from self are NOT suppressed)`
+    );
   }
-  console.log(`  boot sweep:        ${SWEEP_ON_BOOT ? 'ON (WEBHOOK_SWEEP_ON_BOOT=1 — sweeps all open Dependabot PRs each start)' : 'off'}`);
+  console.log(`  processed label:   ${PROCESSED_LABEL}`);
+  console.log(
+    `  boot discovery:    ${DISCOVER_ON_BOOT ? 'ON (enqueue existing open Dependabot PRs)' : 'off (WEBHOOK_DISCOVER_ON_BOOT=0)'}`
+  );
   console.log(`  health endpoint:   http://${BIND_HOST}:${PORT}/health`);
 
-  // Boot sweep: one sequential "all" run per configured repo checkout.
-  if (SWEEP_ON_BOOT) {
-    const repos = TARGET_REPOS.size > 0
-      ? [...TARGET_REPOS]
-      : (ARCHON_WORKDIR ? [resolveTargetRepo(ARCHON_WORKDIR)].filter(Boolean) : []);
-    if (repos.length === 0) {
-      console.warn('Boot sweep enabled but no target repos resolved — skipping sweep.');
-    }
-    for (const repo of repos) {
+  // Backlog discovery on boot: per repo, enqueue every open Dependabot PR that
+  // isn't already labeled. The per-repo serial queue then drains them one at a
+  // time (concurrent across repos), so existing PRs are caught up gradually.
+  if (DISCOVER_ON_BOOT) {
+    for (const repo of TARGET_REPOS) {
       const resolved = workdirForRepo(repo);
       if (resolved.error) {
-        console.warn(`Boot sweep: ${repo} → ${resolved.error}, skipping.`);
+        console.warn(`Boot discovery: ${repo} → ${resolved.error}, skipping.`);
         continue;
       }
-      console.log(`Boot sweep: processing all open Dependabot PRs for ${repo} (one sequential run)...`);
-      triggerPipeline('all', repo, resolved.dir, 'sweep');
+      console.log(`Boot discovery: scanning open Dependabot PRs for ${repo}...`);
+      rediscover(repo, resolved.dir);
     }
   }
 });

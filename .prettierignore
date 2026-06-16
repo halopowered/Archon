@@ -30,6 +30,10 @@ package-lock.json
 .claude/
 .archon/
 
+# Deployment/ops scripts (webhook-host, etc.) — not part of the linted codebase
+# (mirrors the deploy/** ignore in eslint.config.mjs)
+deploy/
+
 # Website (Astro/Starlight - uses own formatting)
 packages/docs-web/
 

@@ -23,6 +23,11 @@ primary_region = 'ord'
   # its own checkout by repository.full_name. Space/comma-separated owner/repo.
   # Add a repo here + redeploy to extend coverage.
   WEBHOOK_TARGET_REPOS = 'halopowered/stack-artifacts'
+  # Backlog drain on boot. OFF for now: new PRs are still handled via webhook,
+  # but the existing open-PR backlog is NOT auto-drained. Set to '1' (or remove)
+  # + redeploy to enqueue every open Dependabot PR (minus those already labeled
+  # 'archon-reviewed') and drain them one at a time per repo.
+  WEBHOOK_DISCOVER_ON_BOOT = '0'
 
 [http_service]
   internal_port = 3000
