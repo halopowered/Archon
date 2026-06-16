@@ -1,0 +1,464 @@
+name: verify-and-merge
+description: |
+  Use when: You want to verify a Dependabot PR by actually checking out
+  the branch and running the project locally (install + build + test),
+  then merge on success.
+
+  Triggers (run): "verify and merge", "verify pr", "run and merge",
+                  "test the pr".
+
+  Input (from $ARGUMENTS): a single PR number, e.g. `57` or `#57`.
+
+  Does:
+  - Validates the input and confirms it's a Dependabot PR
+  - Identifies the project folder (deepest common dir of changed files)
+  - Extracts the semver bump type (patch / minor / major) from the title
+  - Checks out the PR's head branch in the Archon worktree
+  - Runs the canonical install / lint / build / test commands for the
+    detected stack, capturing logs to $ARTIFACTS_DIR
+  - Routes on the combined (verify result, bump type) signal:
+      patch/minor/major + verify pass → approve and squash-merge
+      unparseable bump + verify pass  → comment requesting human review
+      verify fail                     → comment with error excerpt; DO NOT merge
+
+  NOT for: Non-Dependabot PRs, pre-flight readiness checks (use
+           readiness-check), bulk PR sweeps (use dependabot-fix-check).
+
+nodes:
+  # ── Step 1: Validate input + fetch PR metadata ─────────────────────────
+  # Output is one of:
+  #   <JSON object with PR fields>  — happy path
+  #   "INVALID_INPUT"               — $ARGUMENTS isn't a parseable PR ref
+  #   "PR_NOT_FOUND"                — gh couldn't fetch the PR
+  #   "NOT_A_DEPENDABOT_PR"         — author isn't dependabot[bot]
+  - id: fetch-pr
+    bash: |
+      #!/bin/bash
+      set -u
+      ARG=$(echo "$ARGUMENTS" | awk '{$1=$1};1')
+      # Pull a numeric PR ref out of the input (handles "57", "#57", "PR 57").
+      PR_NUMBER=$(echo "$ARG" | grep -oE '[0-9]+' | head -1)
+      if [ -z "$PR_NUMBER" ]; then
+        echo "Provide a PR number, e.g. \"57\" or \"#57\"." \
+          > "$ARTIFACTS_DIR/error.txt"
+        echo "INVALID_INPUT"; exit 0
+      fi
+
+      PR_FIELDS='number,title,author,headRefName,baseRefName,mergeable,statusCheckRollup'
+      if ! pr=$(gh pr view "$PR_NUMBER" --json "$PR_FIELDS" 2>/dev/null); then
+        echo "Could not fetch PR #$PR_NUMBER (does it exist on this repo?)" \
+          > "$ARTIFACTS_DIR/error.txt"
+        echo "PR_NOT_FOUND"; exit 0
+      fi
+
+      author=$(echo "$pr" | jq -r '.author.login')
+      case "$author" in
+        'dependabot[bot]'|app/dependabot|dependabot)
+          echo "$pr" > "$ARTIFACTS_DIR/pr.json"
+          echo "$pr"
+          ;;
+        *)
+          echo "PR #$PR_NUMBER is authored by '$author', not Dependabot." \
+            > "$ARTIFACTS_DIR/error.txt"
+          echo "NOT_A_DEPENDABOT_PR"
+          ;;
+      esac
+    timeout: 15000
+
+  - id: report-fetch-error
+    depends_on: [fetch-pr]
+    when: "$fetch-pr.output == 'INVALID_INPUT'"
+    bash: |
+      echo "VERIFY_INVALID_INPUT" > "$ARTIFACTS_DIR/status.txt"
+      echo "❌ verify-and-merge:"
+      cat "$ARTIFACTS_DIR/error.txt"
+    timeout: 5000
+
+  - id: report-pr-not-found
+    depends_on: [fetch-pr]
+    when: "$fetch-pr.output == 'PR_NOT_FOUND'"
+    bash: |
+      echo "VERIFY_PR_NOT_FOUND" > "$ARTIFACTS_DIR/status.txt"
+      echo "❌ verify-and-merge:"
+      cat "$ARTIFACTS_DIR/error.txt"
+    timeout: 5000
+
+  - id: report-not-dependabot
+    depends_on: [fetch-pr]
+    when: "$fetch-pr.output == 'NOT_A_DEPENDABOT_PR'"
+    bash: |
+      echo "VERIFY_NOT_DEPENDABOT" > "$ARTIFACTS_DIR/status.txt"
+      echo "❌ verify-and-merge:"
+      cat "$ARTIFACTS_DIR/error.txt"
+      echo ""
+      echo "This workflow only verifies and merges Dependabot PRs."
+    timeout: 5000
+
+  # ── Step 2: Gate that decides whether to proceed past validation ───────
+  - id: gate-proceed
+    depends_on: [fetch-pr]
+    bash: |
+      OUTPUT=$fetch-pr.output
+      case "$OUTPUT" in
+        INVALID_INPUT|PR_NOT_FOUND|NOT_A_DEPENDABOT_PR|"")
+          echo "ABORT"
+          ;;
+        *)
+          echo "PROCEED"
+          ;;
+      esac
+    timeout: 5000
+
+  # ── Step 3: Identify the project folder via deepest common dir ────────
+  - id: identify-folder
+    depends_on: [fetch-pr, gate-proceed]
+    when: "$gate-proceed.output == 'PROCEED'"
+    bash: |
+      #!/bin/bash
+      set -eu
+      PR_JSON=$(cat "$ARTIFACTS_DIR/pr.json")
+      PR_NUMBER=$(echo "$PR_JSON" | jq -r '.number')
+      files=$(gh pr diff "$PR_NUMBER" --name-only 2>/dev/null || true)
+      if [ -z "$files" ]; then
+        echo "."
+        exit 0
+      fi
+      echo "$files" | awk -F/ '
+        NR == 1 {
+          common_n = NF - 1
+          for (i = 1; i <= common_n; i++) prefix[i] = $i
+          next
+        }
+        {
+          max_check = (NF - 1 < common_n ? NF - 1 : common_n)
+          new_common = 0
+          for (i = 1; i <= max_check; i++) {
+            if (prefix[i] != $i) break
+            new_common = i
+          }
+          common_n = new_common
+        }
+        END {
+          if (common_n == 0) { print "."; exit }
+          out = prefix[1]
+          for (i = 2; i <= common_n; i++) out = out "/" prefix[i]
+          print out
+        }
+      '
+    timeout: 30000
+
+  # ── Step 4: Extract semver bump type from PR title ─────────────────────
+  # Output: "patch" / "minor" / "major" / "unknown"
+  - id: extract-bump-type
+    depends_on: [fetch-pr, gate-proceed]
+    when: "$gate-proceed.output == 'PROCEED'"
+    bash: |
+      #!/bin/bash
+      set -u
+      title=$(jq -r '.title' "$ARTIFACTS_DIR/pr.json")
+      # Match "Bump <pkg> from a.b.c to d.e.f" — version segments captured.
+      if [[ "$title" =~ from[[:space:]]+([0-9]+)\.([0-9]+)\.([0-9]+).*to[[:space:]]+([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+        OM="${BASH_REMATCH[1]}"; ON="${BASH_REMATCH[2]}"; OP="${BASH_REMATCH[3]}"
+        NM="${BASH_REMATCH[4]}"; NN="${BASH_REMATCH[5]}"; NP="${BASH_REMATCH[6]}"
+        if [ "$OM" != "$NM" ]; then
+          echo "major"
+        elif [ "$ON" != "$NN" ]; then
+          echo "minor"
+        elif [ "$OP" != "$NP" ]; then
+          echo "patch"
+        else
+          # Same version (shouldn't happen for Dependabot but be safe).
+          echo "unknown"
+        fi
+      else
+        echo "unknown"
+      fi
+    timeout: 5000
+
+  # ── Step 5: Checkout the PR's head as a detached HEAD ─────────────────
+  # Uses a detached HEAD instead of creating a local branch. Avoids the
+  # "refusing to fetch into branch checked out at <other worktree>" error
+  # when a stale worktree from a prior run still has the same local
+  # branch checked out.
+  - id: checkout-pr-branch
+    depends_on: [fetch-pr, gate-proceed]
+    when: "$gate-proceed.output == 'PROCEED'"
+    bash: |
+      set -e
+      PR_NUMBER=$(jq -r '.number' "$ARTIFACTS_DIR/pr.json")
+
+      # `pull/<n>/head` works for both same-repo and fork PRs.
+      git fetch origin "pull/$PR_NUMBER/head"
+      git checkout FETCH_HEAD
+
+      echo "detached-at-pr-$PR_NUMBER"
+    timeout: 60000
+
+  # ── Step 6: Install + build + test ────────────────────────────────────
+  - id: verify-build-test
+    depends_on: [identify-folder, checkout-pr-branch]
+    prompt: |
+      You are verifying a Dependabot PR by running the project locally.
+
+      Project folder:  $identify-folder.output
+      Local branch:    $checkout-pr-branch.output (already checked out)
+      Artifacts dir:   $ARTIFACTS_DIR
+
+      Procedure:
+      1. `cd` into the project folder.
+      2. Detect the stack by inspecting manifests:
+         - package.json    → Node / npm
+         - pyproject.toml / requirements.txt → Python
+         - go.mod          → Go
+         - Cargo.toml      → Rust
+      3. Run the canonical install / lint / build / test commands for that
+         stack, IN THAT ORDER. For Node specifically, prefer:
+           npm ci --legacy-peer-deps  (or npm install --legacy-peer-deps if
+                                       lockfile is out of sync)
+           npm run lint --if-present
+           npm run build --if-present
+           npm test --if-present -- --watch=false --browsers=ChromeHeadless
+         For other stacks, run the configured linter too (e.g. `ruff check`,
+         `golangci-lint run`, `cargo clippy`). Skip lint ONLY when the project
+         has no linter configured — never skip it just because it fails.
+      4. Capture stdout+stderr from each step into separate logs:
+           $ARTIFACTS_DIR/install.log
+           $ARTIFACTS_DIR/lint.log
+           $ARTIFACTS_DIR/build.log
+           $ARTIFACTS_DIR/test.log
+         Use `command 2>&1 | tee "$ARTIFACTS_DIR/<step>.log"`.
+      5. Stop on the first failure — don't run later steps after a failure.
+         A lint failure is a real failure (failure_reason="lint") — this gate
+         auto-merges major bumps, so lint/build/test must all be green.
+
+      Environment caveats (treat as environment failures, NOT project bugs):
+      - Browser missing for headless tests (Chrome / Chromium not installed)
+      - Network restrictions blocking npm registry / PyPI
+      - Disk-space or permissions errors
+
+      Output structured JSON describing what happened. The `error_excerpt`
+      should be the LAST 30 lines of the failing step's log (or the empty
+      string on success). The `command_log` is a short bullet list of the
+      exact commands you ran, in order.
+
+      Stack detection is mandatory — if no recognizable manifest is found,
+      mark success="no" with a clear failure_reason.
+    model: sonnet
+    allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
+    output_format:
+      type: object
+      properties:
+        success:
+          type: string
+          enum: ["yes", "no"]
+        detected_stack:
+          type: string
+        failure_reason:
+          type: string
+          enum: ["", "install", "lint", "build", "test", "no_stack_detected", "environment"]
+        summary:
+          type: string
+        error_excerpt:
+          type: string
+        command_log:
+          type: string
+      required: [success, detected_stack, failure_reason, summary, error_excerpt, command_log]
+
+  # ── Step 7: Gate that combines verify result + bump type → action ─────
+  # Output: "MERGE" | "MAJOR_REVIEW" | "FAIL_COMMENT" | "ABORT"
+  - id: gate-action
+    depends_on: [verify-build-test, extract-bump-type]
+    bash: |
+      #!/bin/bash
+      SUCCESS=$verify-build-test.output.success
+      BUMP=$extract-bump-type.output
+
+      if [ "$SUCCESS" = "no" ]; then
+        echo "FAIL_COMMENT"
+      elif [ "$BUMP" = "patch" ] || [ "$BUMP" = "minor" ] || [ "$BUMP" = "major" ]; then
+        # Policy: auto-merge any bump — including major — once local
+        # verification (install + lint + build + test) passes. Required
+        # GitHub status checks are still enforced server-side at merge time.
+        echo "MERGE"
+      elif [ "$BUMP" = "unknown" ]; then
+        # Couldn't parse a semver bump from the title (e.g. a grouped /
+        # multi-package PR) → escalate to human review rather than guess.
+        echo "MAJOR_REVIEW"
+      else
+        echo "ABORT"
+      fi
+    timeout: 5000
+
+  # ── Step 8a: Patch/minor + verify pass → approve and merge ────────────
+  - id: approve-and-merge
+    depends_on: [gate-action, fetch-pr, extract-bump-type, verify-build-test]
+    when: "$gate-action.output == 'MERGE'"
+    bash: |
+      set -e
+      # Provisional — overwritten on successful merge below.
+      echo "VERIFY_MERGE_FAILED" > "$ARTIFACTS_DIR/status.txt"
+
+      PR_NUMBER=$(jq -r '.number' "$ARTIFACTS_DIR/pr.json")
+      BUMP=$extract-bump-type.output
+      STACK=$verify-build-test.output.detected_stack
+      OWNER_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+
+      # Approve via REST. Tolerated on failure — a prior run may have
+      # already submitted an approval, and GitHub may reject duplicates.
+      gh api -X POST "repos/$OWNER_REPO/pulls/$PR_NUMBER/reviews" \
+        -f event=APPROVE \
+        -f body="Auto-approved: Dependabot $BUMP bump — local $STACK verification (install/lint/build/test) all green." \
+        >/dev/null 2>&1 \
+        || echo "  (approve failed — likely already approved by an earlier run; continuing)"
+
+      # Bring the PR head up to date with the base, then squash-merge — with
+      # polling + retries. `update-branch` is ASYNCHRONOUS: GitHub returns 202
+      # and performs the merge of base→head in the background. Branch
+      # protection that requires "up to date with base" will 409 a merge
+      # attempted before that update lands. A single update-branch + immediate
+      # merge therefore races and fails (the `Head branch is out of date`
+      # error). So we poll `mergeable_state` and retry instead.
+      #
+      # Merge is via REST (no CLI) → no git side-effects on the worktree, so
+      # we can't get stuck on `main` afterward.
+      merged=""
+      state="unknown"
+      for attempt in 1 2 3 4 5 6; do
+        state=$(gh api "repos/$OWNER_REPO/pulls/$PR_NUMBER" -q .mergeable_state 2>/dev/null || echo unknown)
+        case "$state" in
+          dirty)
+            echo "  PR #$PR_NUMBER has merge conflicts (mergeable_state=dirty); not merging."
+            break
+            ;;
+          behind)
+            echo "  attempt $attempt: head behind base — requesting update-branch (async)..."
+            gh api -X PUT "repos/$OWNER_REPO/pulls/$PR_NUMBER/update-branch" >/dev/null 2>&1 || true
+            sleep 5
+            continue
+            ;;
+          unknown)
+            echo "  attempt $attempt: GitHub still computing mergeability — waiting..."
+            sleep 5
+            continue
+            ;;
+        esac
+        # clean / unstable / blocked / has_hooks → attempt the merge.
+        if gh api -X PUT "repos/$OWNER_REPO/pulls/$PR_NUMBER/merge" \
+             -f merge_method=squash >/dev/null 2>"$ARTIFACTS_DIR/merge-err.txt"; then
+          merged="yes"
+          break
+        fi
+        echo "  attempt $attempt: merge rejected (state=$state): $(tr '\n' ' ' < "$ARTIFACTS_DIR/merge-err.txt")"
+        sleep 5
+      done
+
+      if [ -z "$merged" ]; then
+        echo "❌ PR #$PR_NUMBER: could not merge after retries (last mergeable_state=$state)."
+        exit 1
+      fi
+
+      # Delete the head branch on origin via REST.
+      HEAD_REF=$(gh api "repos/$OWNER_REPO/pulls/$PR_NUMBER" -q .head.ref)
+      if [ -n "$HEAD_REF" ]; then
+        gh api -X DELETE "repos/$OWNER_REPO/git/refs/heads/$HEAD_REF" 2>/dev/null || true
+      fi
+
+      echo "✅ PR #$PR_NUMBER: approved and squash-merged ($BUMP bump, verified locally)"
+      echo "VERIFY_MERGED" > "$ARTIFACTS_DIR/status.txt"
+    timeout: 90000
+
+  # ── Step 8b: Major (or unknown) bump + verify pass → comment ──────────
+  - id: comment-major-review
+    depends_on: [gate-action, fetch-pr, extract-bump-type, verify-build-test]
+    when: "$gate-action.output == 'MAJOR_REVIEW'"
+    bash: |
+      set -e
+      PR_NUMBER=$(jq -r '.number' "$ARTIFACTS_DIR/pr.json")
+      BUMP=$extract-bump-type.output
+      SUMMARY=$verify-build-test.output.summary
+      STACK=$verify-build-test.output.detected_stack
+      OWNER_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+
+      BODY="🔍 **Human review required.**
+
+      Couldn't determine the version-bump type from this PR's title (likely a
+      grouped or multi-package update), so it was not auto-merged. Local
+      verification ($STACK install/lint/build/test) passed:
+
+      > $SUMMARY
+
+      Please review and merge manually if the change looks safe."
+
+      gh api -X POST "repos/$OWNER_REPO/issues/$PR_NUMBER/comments" \
+        -f body="$BODY" >/dev/null
+
+      echo "💬 PR #$PR_NUMBER: posted human-review request (unparseable bump, verify passed)"
+      echo "VERIFY_MAJOR_REVIEW" > "$ARTIFACTS_DIR/status.txt"
+    timeout: 30000
+
+  # ── Step 8c: Verify failed → comment with error excerpt, no merge ─────
+  - id: comment-verify-failed
+    depends_on: [gate-action, fetch-pr, verify-build-test]
+    when: "$gate-action.output == 'FAIL_COMMENT'"
+    bash: |
+      set -e
+      PR_NUMBER=$(jq -r '.number' "$ARTIFACTS_DIR/pr.json")
+      STACK=$verify-build-test.output.detected_stack
+      REASON=$verify-build-test.output.failure_reason
+      SUMMARY=$verify-build-test.output.summary
+      ERROR_EXCERPT=$verify-build-test.output.error_excerpt
+
+      # Map the structured failure reason to an orchestrator sentinel.
+      case "$REASON" in
+        install)           STATUS="VERIFY_FAILED_INSTALL" ;;
+        lint)              STATUS="VERIFY_FAILED_LINT" ;;
+        build)             STATUS="VERIFY_FAILED_BUILD" ;;
+        test)              STATUS="VERIFY_FAILED_TEST" ;;
+        environment)       STATUS="VERIFY_FAILED_ENV" ;;
+        no_stack_detected) STATUS="VERIFY_FAILED_NO_STACK" ;;
+        *)                 STATUS="VERIFY_FAILED_OTHER" ;;
+      esac
+      echo "$STATUS" > "$ARTIFACTS_DIR/status.txt"
+
+      BODY_FILE="$ARTIFACTS_DIR/fail-comment.md"
+      {
+        echo "❌ **Local verification failed.** Not auto-merged."
+        echo ""
+        echo "Stack:   $STACK"
+        echo "Failed:  $REASON"
+        echo ""
+        echo "Summary: $SUMMARY"
+        echo ""
+        echo "<details><summary>Error excerpt (last 30 lines)</summary>"
+        echo ""
+        echo '```'
+        echo "$ERROR_EXCERPT"
+        echo '```'
+        echo ""
+        echo "</details>"
+      } > "$BODY_FILE"
+
+      OWNER_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+      gh api -X POST "repos/$OWNER_REPO/issues/$PR_NUMBER/comments" \
+        -F body=@"$BODY_FILE" >/dev/null
+
+      echo "💬 PR #$PR_NUMBER: posted verify-failed comment ($REASON)"
+
+  # ── Final: emit the orchestrator-readable status marker ──────────────
+  - id: report-status
+    depends_on:
+      - report-fetch-error
+      - report-pr-not-found
+      - report-not-dependabot
+      - approve-and-merge
+      - comment-major-review
+      - comment-verify-failed
+    trigger_rule: all_done
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/status.txt" ]; then
+        STATUS=$(cat "$ARTIFACTS_DIR/status.txt" | tr -d '[:space:]')
+      else
+        STATUS="VERIFY_UNKNOWN"
+      fi
+      echo "<<<STATUS:$STATUS>>>"
+    timeout: 5000

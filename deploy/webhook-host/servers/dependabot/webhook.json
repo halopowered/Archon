@@ -1,0 +1,10 @@
+{
+  "name": "dependabot",
+  "path": "/dependabot",
+  "port": 9101,
+  "entry": "server.js",
+  "env": {
+    "ARCHON_FROM_BRANCH": "main",
+    "WEBHOOK_BIND_HOST": "127.0.0.1"
+  }
+}

@@ -1,0 +1,366 @@
+name: auto-fix-install
+description: |
+  Use when: verify-and-merge reported `failure_reason: install` on a
+  Dependabot PR and you want to attempt a Tier-1 mechanical fix
+  (regenerate lockfile, no source-code edits).
+
+  Triggers (run): "auto-fix install", "tier-1 fix", "fix install pr".
+
+  Input (from $ARGUMENTS): a single Dependabot PR number, e.g. "57".
+
+  Does:
+  - Validates the PR is a Dependabot PR
+  - Identifies the project folder
+  - Checks out the PR's head branch in the Archon worktree
+  - Runs `npm install --legacy-peer-deps` (regenerates lockfile if needed)
+  - Verifies the new tree state with build + test
+  - On success: opens a new branch with the regenerated lockfile, opens
+    a replacement PR against main, auto-approves and squash-merges it,
+    and comments on the original Dependabot PR
+  - On no-fix-available: comments on the original PR with the diagnostic
+    and stops (no PR opened)
+
+  NOT for: build or test failures (Tier 2+), code edits, non-Dependabot
+           PRs, non-Node stacks (Tier 1 is Node/npm-only).
+
+nodes:
+  # ── Step 1: Fetch + validate the PR ───────────────────────────────────
+  # Output: <PR JSON> | INVALID_INPUT | PR_NOT_FOUND | NOT_A_DEPENDABOT_PR
+  - id: fetch-pr
+    bash: |
+      #!/bin/bash
+      set -u
+      ARG=$(echo "$ARGUMENTS" | awk '{$1=$1};1')
+      PR_NUMBER=$(echo "$ARG" | grep -oE '[0-9]+' | head -1)
+      if [ -z "$PR_NUMBER" ]; then
+        echo "Provide a PR number, e.g. \"57\" or \"#57\"." \
+          > "$ARTIFACTS_DIR/error.txt"
+        echo "INVALID_INPUT"; exit 0
+      fi
+
+      PR_FIELDS='number,title,author,headRefName,baseRefName,mergeable'
+      if ! pr=$(gh pr view "$PR_NUMBER" --json "$PR_FIELDS" 2>/dev/null); then
+        echo "Could not fetch PR #$PR_NUMBER (does it exist on this repo?)" \
+          > "$ARTIFACTS_DIR/error.txt"
+        echo "PR_NOT_FOUND"; exit 0
+      fi
+
+      author=$(echo "$pr" | jq -r '.author.login')
+      case "$author" in
+        'dependabot[bot]'|app/dependabot|dependabot)
+          echo "$pr" > "$ARTIFACTS_DIR/pr.json"
+          echo "$pr"
+          ;;
+        *)
+          echo "PR #$PR_NUMBER is authored by '$author', not Dependabot." \
+            > "$ARTIFACTS_DIR/error.txt"
+          echo "NOT_A_DEPENDABOT_PR"
+          ;;
+      esac
+    timeout: 15000
+
+  # ── Step 2: Single gate that routes on validation result ──────────────
+  # Output: PROCEED | ERROR
+  - id: gate-fetch
+    depends_on: [fetch-pr]
+    bash: |
+      OUTPUT=$fetch-pr.output
+      case "$OUTPUT" in
+        INVALID_INPUT|PR_NOT_FOUND|NOT_A_DEPENDABOT_PR|"")
+          echo "ERROR"
+          ;;
+        *)
+          echo "PROCEED"
+          ;;
+      esac
+    timeout: 5000
+
+  - id: report-fetch-error
+    depends_on: [fetch-pr, gate-fetch]
+    when: "$gate-fetch.output == 'ERROR'"
+    bash: |
+      OUTPUT=$fetch-pr.output
+      case "$OUTPUT" in
+        INVALID_INPUT)        STATUS="AUTOFIX_INVALID_INPUT" ;;
+        PR_NOT_FOUND)         STATUS="AUTOFIX_PR_NOT_FOUND" ;;
+        NOT_A_DEPENDABOT_PR)  STATUS="AUTOFIX_NOT_DEPENDABOT" ;;
+        *)                    STATUS="AUTOFIX_UNKNOWN_ERROR" ;;
+      esac
+      echo "$STATUS" > "$ARTIFACTS_DIR/status.txt"
+
+      echo "❌ auto-fix-install:"
+      cat "$ARTIFACTS_DIR/error.txt"
+    timeout: 5000
+
+  # ── Step 3: Identify the project folder ───────────────────────────────
+  - id: identify-folder
+    depends_on: [fetch-pr, gate-fetch]
+    when: "$gate-fetch.output == 'PROCEED'"
+    bash: |
+      #!/bin/bash
+      set -eu
+      PR_NUMBER=$(jq -r '.number' "$ARTIFACTS_DIR/pr.json")
+      files=$(gh pr diff "$PR_NUMBER" --name-only 2>/dev/null || true)
+      if [ -z "$files" ]; then
+        echo "."
+        exit 0
+      fi
+      echo "$files" | awk -F/ '
+        NR == 1 {
+          common_n = NF - 1
+          for (i = 1; i <= common_n; i++) prefix[i] = $i
+          next
+        }
+        {
+          max_check = (NF - 1 < common_n ? NF - 1 : common_n)
+          new_common = 0
+          for (i = 1; i <= max_check; i++) {
+            if (prefix[i] != $i) break
+            new_common = i
+          }
+          common_n = new_common
+        }
+        END {
+          if (common_n == 0) { print "."; exit }
+          out = prefix[1]
+          for (i = 2; i <= common_n; i++) out = out "/" prefix[i]
+          print out
+        }
+      '
+    timeout: 30000
+
+  # ── Step 4: Checkout the PR's head branch ─────────────────────────────
+  - id: checkout-pr-branch
+    depends_on: [fetch-pr, gate-fetch]
+    when: "$gate-fetch.output == 'PROCEED'"
+    bash: |
+      set -e
+      PR_NUMBER=$(jq -r '.number' "$ARTIFACTS_DIR/pr.json")
+      HEAD_REF=$(jq -r '.headRefName' "$ARTIFACTS_DIR/pr.json")
+      LOCAL_BRANCH="autofix/pr-$PR_NUMBER"
+
+      # Use a detached HEAD instead of creating a local branch — avoids
+      # "refusing to fetch into branch checked out at <other worktree>"
+      # errors from stale worktrees, and avoids git's tracking-setup
+      # output contaminating this node's stdout.
+      git fetch origin "pull/$PR_NUMBER/head" >/dev/null 2>&1
+      git checkout FETCH_HEAD >/dev/null 2>&1
+
+      echo "detached-at-pr-$PR_NUMBER"
+    timeout: 60000
+
+  # ── Step 5: Attempt the Tier-1 mechanical fix ─────────────────────────
+  # Strategy: run `npm install --legacy-peer-deps` (which regenerates the
+  # lockfile if it's drifted), then verify build + test on the new tree.
+  #
+  # Outputs (one of):
+  #   FIXED               — install/build/test all pass, lockfile changed
+  #   NO_FIX_AVAILABLE    — install failed, lockfile didn't change, or
+  #                         build/test failed even after regen
+  - id: attempt-tier-1-fix
+    depends_on: [identify-folder, checkout-pr-branch]
+    bash: |
+      #!/bin/bash
+      set -u
+
+      FOLDER=$identify-folder.output
+
+      log_diag() { echo "$1" >> "$ARTIFACTS_DIR/diagnostic.txt"; }
+
+      # Validate the project folder has a Node manifest. Tier-1 is
+      # Node/npm-only.
+      if [ ! -f "$FOLDER/package.json" ]; then
+        log_diag "Folder $FOLDER has no package.json. Tier-1 supports npm projects only."
+        echo "NO_FIX_AVAILABLE"; exit 0
+      fi
+
+      cd "$FOLDER" || { log_diag "Could not cd into $FOLDER"; echo "NO_FIX_AVAILABLE"; exit 0; }
+
+      # Snapshot the original lockfile so we can detect if regen changed it.
+      if [ -f package-lock.json ]; then
+        cp package-lock.json "$ARTIFACTS_DIR/lockfile.original.json"
+      else
+        log_diag "No existing package-lock.json — Tier-1 fix only applies to projects with a lockfile."
+        echo "NO_FIX_AVAILABLE"; exit 0
+      fi
+
+      # Step A: regenerate via `npm install --legacy-peer-deps`.
+      if ! npm install --legacy-peer-deps \
+           > "$ARTIFACTS_DIR/install.log" 2>&1; then
+        log_diag "npm install --legacy-peer-deps failed even after regen attempt. See install.log."
+        echo "NO_FIX_AVAILABLE"; exit 0
+      fi
+
+      # Step B: did the lockfile actually change? If not, the original was
+      # already valid — failure was transient or environmental, no PR to open.
+      if cmp -s package-lock.json "$ARTIFACTS_DIR/lockfile.original.json"; then
+        log_diag "Lockfile is unchanged after npm install. Original failure was likely transient — no fix to apply."
+        echo "NO_FIX_AVAILABLE"; exit 0
+      fi
+
+      cp package-lock.json "$ARTIFACTS_DIR/lockfile.regenerated.json"
+
+      # Step C: verify build still passes on the regenerated tree.
+      if ! npm run build --if-present \
+           > "$ARTIFACTS_DIR/build.log" 2>&1; then
+        log_diag "Lockfile regen succeeded, but build failed. Tier-1 cannot fix build failures. See build.log."
+        echo "NO_FIX_AVAILABLE"; exit 0
+      fi
+
+      # Step D: verify tests still pass.
+      if ! npm test --if-present -- --watch=false --browsers=ChromeHeadless \
+           > "$ARTIFACTS_DIR/test.log" 2>&1; then
+        log_diag "Lockfile regen + build succeeded, but tests failed. Tier-1 cannot fix test failures. See test.log."
+        echo "NO_FIX_AVAILABLE"; exit 0
+      fi
+
+      # All green — Tier-1 fix applies.
+      echo "FIXED"
+    timeout: 600000
+
+  # ── Step 6a: Open replacement PR + auto-merge ─────────────────────────
+  - id: open-replacement-pr-and-merge
+    depends_on: [attempt-tier-1-fix, fetch-pr, identify-folder]
+    when: "$attempt-tier-1-fix.output == 'FIXED'"
+    bash: |
+      set -e
+      # Provisional — overwritten on success at the end.
+      echo "AUTOFIX_MERGE_FAILED" > "$ARTIFACTS_DIR/status.txt"
+
+      PR_NUMBER=$(jq -r '.number' "$ARTIFACTS_DIR/pr.json")
+      ORIG_TITLE=$(jq -r '.title' "$ARTIFACTS_DIR/pr.json")
+      FOLDER=$identify-folder.output
+      FIX_BRANCH="fix/install-pr-$PR_NUMBER"
+
+      # Branch off current HEAD (Dependabot's branch tip + uncommitted lockfile diff).
+      git checkout -B "$FIX_BRANCH"
+      git add "$FOLDER/package-lock.json"
+
+      if git diff --cached --quiet; then
+        echo "❌ No staged changes. Aborting replacement PR (this should not happen if attempt-tier-1-fix returned FIXED)."
+        exit 1
+      fi
+
+      git commit -m "fix: regenerate lockfile to resolve install failure on PR #$PR_NUMBER"
+
+      git push -u origin "$FIX_BRANCH" >/dev/null 2>&1
+
+      PR_BODY_FILE="$ARTIFACTS_DIR/replacement-pr-body.md"
+      {
+        echo "## Summary"
+        echo ""
+        echo "Replaces Dependabot PR #$PR_NUMBER. Same dependency bump,"
+        echo "with a regenerated \`package-lock.json\` to resolve an install failure."
+        echo ""
+        echo "## Tier-1 auto-fix details"
+        echo ""
+        echo "The original PR's lockfile was out of sync with its \`package.json\`"
+        echo "(or had a peer-dep conflict). \`npm install --legacy-peer-deps\` regenerated"
+        echo "the lockfile, after which install / build / test all pass."
+        echo ""
+        echo "Verified locally in the Archon worktree:"
+        echo "- \`npm install --legacy-peer-deps\` ✅"
+        echo "- \`npm run build\` ✅"
+        echo "- \`npm test\` ✅"
+        echo ""
+        echo "Auto-generated by the \`auto-fix-install\` Archon workflow (Tier 1)."
+      } > "$PR_BODY_FILE"
+
+      OWNER_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+
+      # Open the replacement PR via REST API directly. Avoids gh CLI's
+      # internal git introspection that broke prior runs in multi-worktree
+      # state.
+      NEW_PR_JSON=$(gh api -X POST "repos/$OWNER_REPO/pulls" \
+        -f title="$ORIG_TITLE" \
+        -F body=@"$PR_BODY_FILE" \
+        -f head="$FIX_BRANCH" \
+        -f base=main)
+      NEW_PR_NUMBER=$(echo "$NEW_PR_JSON" | jq -r '.number')
+      new_pr_url=$(echo "$NEW_PR_JSON" | jq -r '.html_url')
+      echo "📬 Opened replacement PR: $new_pr_url (#$NEW_PR_NUMBER)"
+
+      # Approve via REST. Tolerated on failure.
+      gh api -X POST "repos/$OWNER_REPO/pulls/$NEW_PR_NUMBER/reviews" \
+        -f event=APPROVE \
+        -f body="Tier-1 install fix verified locally (install + build + test all green)." \
+        >/dev/null 2>&1 || echo "  (approve failed; continuing to merge)"
+
+      # Squash-merge via REST.
+      gh api -X PUT "repos/$OWNER_REPO/pulls/$NEW_PR_NUMBER/merge" \
+        -f merge_method=squash >/dev/null
+
+      # Delete the fix branch on origin (no --delete-branch on the CLI;
+      # avoids worktree-on-main side-effect we saw before).
+      gh api -X DELETE "repos/$OWNER_REPO/git/refs/heads/$FIX_BRANCH" 2>/dev/null || true
+
+      echo "AUTOFIX_MERGED" > "$ARTIFACTS_DIR/status.txt"
+
+      # Comment on the original Dependabot PR.
+      ORIG_COMMENT="🛠️ **Tier-1 install fix applied.**
+
+      Replacement PR: $new_pr_url (auto-approved and squash-merged).
+
+      Dependabot will close this PR automatically once the dependency is at the requested version on \`main\`. If it doesn't, this PR can be closed manually."
+
+      gh api -X POST "repos/$OWNER_REPO/issues/$PR_NUMBER/comments" \
+        -f body="$ORIG_COMMENT" >/dev/null
+
+      echo "✅ Replacement PR merged: $new_pr_url"
+    timeout: 180000
+
+  # ── Step 6b: No fix available — comment with diagnostic ───────────────
+  - id: comment-no-fix-available
+    depends_on: [attempt-tier-1-fix, fetch-pr]
+    when: "$attempt-tier-1-fix.output == 'NO_FIX_AVAILABLE'"
+    bash: |
+      set -e
+      echo "AUTOFIX_NO_FIX_AVAILABLE" > "$ARTIFACTS_DIR/status.txt"
+      PR_NUMBER=$(jq -r '.number' "$ARTIFACTS_DIR/pr.json")
+
+      DIAG=""
+      if [ -f "$ARTIFACTS_DIR/diagnostic.txt" ]; then
+        DIAG=$(cat "$ARTIFACTS_DIR/diagnostic.txt")
+      fi
+
+      BODY_FILE="$ARTIFACTS_DIR/no-fix-comment.md"
+      {
+        echo "🔧 **Tier-1 auto-fix attempted; no mechanical fix applies.**"
+        echo ""
+        if [ -n "$DIAG" ]; then
+          echo "Diagnostic:"
+          echo ""
+          echo '```'
+          echo "$DIAG"
+          echo '```'
+          echo ""
+        fi
+        echo "This failure is outside the scope of Tier-1 (lockfile regeneration only)."
+        echo "Resolving will require a Tier-2 dep-graph edit (overrides / pin / downgrade)"
+        echo "or a Tier-3 source-code change."
+        echo ""
+        echo "_Posted by the \`auto-fix-install\` Archon workflow._"
+      } > "$BODY_FILE"
+
+      OWNER_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+      gh api -X POST "repos/$OWNER_REPO/issues/$PR_NUMBER/comments" \
+        -F body=@"$BODY_FILE" >/dev/null
+
+      echo "💬 PR #$PR_NUMBER: posted no-fix-available comment"
+    timeout: 30000
+
+  # ── Final: emit the orchestrator-readable status marker ──────────────
+  - id: report-status
+    depends_on:
+      - report-fetch-error
+      - open-replacement-pr-and-merge
+      - comment-no-fix-available
+    trigger_rule: all_done
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/status.txt" ]; then
+        STATUS=$(cat "$ARTIFACTS_DIR/status.txt" | tr -d '[:space:]')
+      else
+        STATUS="AUTOFIX_UNKNOWN"
+      fi
+      echo "<<<STATUS:$STATUS>>>"
+    timeout: 5000

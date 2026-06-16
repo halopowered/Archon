@@ -18,6 +18,7 @@ export default tseslint.config(
       '.claude/worktrees/**',
       '.claude/skills/**',
       '.archon/**', // User workflow/script/command content — not in any tsconfig project
+      'deploy/**', // Deployment/ops scripts (webhook-host, etc.) — not in any tsconfig project
       '**/*.generated.ts', // Auto-generated source files (content inlined via JSON.stringify)
       '**/*.js',
       '*.mjs',

@@ -1,0 +1,356 @@
+name: dependabot-fix-check
+description: |
+  Use when: You want to automatically approve and merge low-risk Dependabot
+  dependency updates while flagging breaking changes for human review.
+
+  Routing (from $ARGUMENTS):
+  - A PR number (e.g., "57", "#57", "PR 57") → process just that PR.
+    If the PR isn't authored by Dependabot, print a message and stop.
+  - A dependency name (e.g., "vite", "lodash", "angular-devkit") → look up
+    matching open Dependabot PRs by title.
+      0 matches  → silent no-op (nothing to process)
+      1 match    → process it
+      >1 matches → stop and ask the user to pick (print candidates)
+  - "all" (or "every", "sweep") → process every open Dependabot PR
+  - Empty, unclear, or doesn't match the above → ask for clarification and stop
+
+  Does, for each targeted PR:
+  - Identifies the project folder by computing the deepest common directory
+    of the PR's changed files (e.g., examples/ts-charting-library/frontend)
+  - Extracts the dependency bump type (patch/minor/major) from title and diff
+  - Checks for merge conflicts and posts a comment if conflicts exist
+  - Waits for all CI checks to pass
+  - Auto-approves and auto-merges patch and minor version bumps when CI is green
+  - Posts a review-request comment for major version bumps (no auto-merge)
+
+  NOT for: Manual code reviews, non-Dependabot PRs, or bypassing security gates.
+
+nodes:
+  # ── Step 1: Classify the user's intent from $ARGUMENTS ─────────────────
+  - id: classify-input
+    prompt: |
+      You are the input classifier for the `dependabot-fix-check` workflow.
+
+      User input: $ARGUMENTS
+
+      Decide which of these modes applies and output structured JSON.
+
+      Modes:
+      - "all"               — user asked to process every open Dependabot PR
+                              (phrases like "all", "every", "all of them",
+                               "sweep", "run on all").
+      - "single-by-number"  — user gave a PR number (e.g., "57", "#57",
+                               "PR 57", "pull request 57"). Extract the number.
+      - "single-by-name"    — user gave a dependency or package name to match
+                               against PR titles (e.g., "vite",
+                               "angular-devkit", "lodash", "the vite one").
+                               Capture the bare search term (strip filler like
+                               "the", "one", "please").
+      - "ambiguous"         — input is empty, unclear, self-contradictory,
+                               or doesn't fit any pattern above.
+
+      Always output both `pr_number` and `search_term`, using "" when unused.
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [all, single-by-number, single-by-name, ambiguous]
+        pr_number:
+          type: string
+        search_term:
+          type: string
+      required: [mode, pr_number, search_term]
+
+  # ── Step 2a: Ambiguous input — ask for clarification and stop ──────────
+  - id: ask-for-clarification
+    depends_on: [classify-input]
+    when: "$classify-input.output.mode == 'ambiguous'"
+    bash: |
+      cat <<'EOF'
+      Clarification needed.
+
+      Tell me one of:
+        • A PR number           — e.g. "PR 57" or "#57"
+        • A dependency name     — e.g. "vite", "lodash", "angular-devkit"
+        • "all"                 — to process every open Dependabot PR
+
+      Re-run the workflow with one of the above.
+      EOF
+    timeout: 5000
+
+  # ── Step 2b: Build the list of PRs to process (or emit a skip sentinel) ─
+  #
+  # Possible outputs:
+  #   <JSON array of PRs>       — proceed to processing
+  #   "EMPTY"                   — silent no-op (0 PRs to process)
+  #   "NOT_A_DEPENDABOT_PR"     — single-by-number but author isn't Dependabot
+  #   "MULTIPLE_NAME_MATCHES"   — single-by-name with >1 matches; candidates
+  #                               written to $ARTIFACTS_DIR/name-match-candidates.txt
+  - id: build-pr-list
+    depends_on: [classify-input]
+    when: "$classify-input.output.mode != 'ambiguous'"
+    bash: |
+      #!/bin/bash
+      set -eu
+
+      MODE=$classify-input.output.mode
+      PR_NUMBER=$classify-input.output.pr_number
+      SEARCH_TERM=$classify-input.output.search_term
+
+      PR_FIELDS='number,title,author,mergeable,statusCheckRollup'
+
+      case "$MODE" in
+        all)
+          prs=$(gh pr list \
+            --author "app/dependabot" \
+            --state open \
+            --json "$PR_FIELDS" \
+            --limit 100)
+          count=$(echo "$prs" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            echo "EMPTY"
+          else
+            echo "$prs"
+          fi
+          ;;
+
+        single-by-number)
+          if [ -z "$PR_NUMBER" ]; then
+            echo "NOT_A_DEPENDABOT_PR"
+            exit 0
+          fi
+          if ! pr=$(gh pr view "$PR_NUMBER" --json "$PR_FIELDS" 2>/dev/null); then
+            echo "NOT_A_DEPENDABOT_PR"
+            exit 0
+          fi
+          author=$(echo "$pr" | jq -r '.author.login')
+          case "$author" in
+            'dependabot[bot]'|app/dependabot|dependabot)
+              echo "[$pr]"
+              ;;
+            *)
+              echo "NOT_A_DEPENDABOT_PR"
+              ;;
+          esac
+          ;;
+
+        single-by-name)
+          if [ -z "$SEARCH_TERM" ]; then
+            echo "EMPTY"
+            exit 0
+          fi
+          matches=$(gh pr list \
+            --author "app/dependabot" \
+            --state open \
+            --search "$SEARCH_TERM in:title" \
+            --json "$PR_FIELDS" \
+            --limit 10)
+          count=$(echo "$matches" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            echo "EMPTY"
+          elif [ "$count" -eq 1 ]; then
+            echo "$matches"
+          else
+            # Persist the candidate list for the reporter node to show.
+            echo "$matches" \
+              | jq -r '.[] | "  #\(.number)  \(.title)"' \
+              > "$ARTIFACTS_DIR/name-match-candidates.txt"
+            echo "MULTIPLE_NAME_MATCHES"
+          fi
+          ;;
+
+        *)
+          echo "EMPTY"
+          ;;
+      esac
+    timeout: 30000
+
+  # ── Step 3a: Report a non-Dependabot PR and stop ───────────────────────
+  - id: report-not-dependabot
+    depends_on: [classify-input, build-pr-list]
+    when: "$build-pr-list.output == 'NOT_A_DEPENDABOT_PR'"
+    bash: |
+      PR_NUMBER=$classify-input.output.pr_number
+      if [ -z "$PR_NUMBER" ]; then
+        PR_REF="(no number provided)"
+      else
+        PR_REF="#$PR_NUMBER"
+      fi
+      cat <<EOF
+      PR $PR_REF is not a Dependabot PR (or doesn't exist on this repository).
+
+      This workflow only processes PRs authored by \`dependabot[bot]\`.
+      If you meant a different PR, re-run with a Dependabot PR number or a
+      dependency name that matches a Dependabot PR title.
+      EOF
+    timeout: 5000
+
+  # ── Step 3b: Report multiple name matches and ask the user to pick ─────
+  - id: report-multi-match
+    depends_on: [classify-input, build-pr-list]
+    when: "$build-pr-list.output == 'MULTIPLE_NAME_MATCHES'"
+    bash: |
+      SEARCH_TERM=$classify-input.output.search_term
+      echo "Multiple open Dependabot PRs matched \"$SEARCH_TERM\"."
+      echo ""
+      echo "Candidates:"
+      if [ -f "$ARTIFACTS_DIR/name-match-candidates.txt" ]; then
+        cat "$ARTIFACTS_DIR/name-match-candidates.txt"
+      fi
+      echo ""
+      echo "Re-run with one of:"
+      echo "  • A specific PR number  — e.g. 'PR <number>' or '#<number>'"
+      echo "  • A more specific name  — enough to match exactly one PR title"
+    timeout: 5000
+
+  # ── Step 3c: Gate the processing loop ──────────────────────────────────
+  # Emits "PROCEED" only when build-pr-list produced an actual JSON array.
+  # Any skip sentinel (EMPTY / NOT_A_DEPENDABOT_PR / MULTIPLE_NAME_MATCHES)
+  # emits "SKIP", which prevents the expensive loop node from running.
+  - id: gate-process
+    depends_on: [classify-input, build-pr-list]
+    when: "$classify-input.output.mode != 'ambiguous'"
+    bash: |
+      OUTPUT=$build-pr-list.output
+      case "$OUTPUT" in
+        EMPTY|NOT_A_DEPENDABOT_PR|MULTIPLE_NAME_MATCHES|"")
+          echo "SKIP"
+          ;;
+        *)
+          echo "PROCEED"
+          ;;
+      esac
+    timeout: 5000
+
+  # ── Step 4: Identify the project folder for each PR ───────────────────
+  # Enriches each PR object with `project_folder`: the deepest common
+  # directory of the PR's changed files. For Dependabot PRs this is
+  # typically the folder containing the touched manifest + lockfile (e.g.
+  # examples/ts-charting-library/frontend). Falls back to "." (repo root)
+  # when there's no shared parent.
+  - id: identify-project-folders
+    depends_on: [build-pr-list, gate-process]
+    when: "$gate-process.output == 'PROCEED'"
+    bash: |
+      #!/bin/bash
+      set -eu
+
+      PRS_JSON=$build-pr-list.output
+
+      common_prefix() {
+        awk -F/ '
+          NR == 1 {
+            common_n = NF - 1
+            for (i = 1; i <= common_n; i++) prefix[i] = $i
+            next
+          }
+          {
+            max_check = (NF - 1 < common_n ? NF - 1 : common_n)
+            new_common = 0
+            for (i = 1; i <= max_check; i++) {
+              if (prefix[i] != $i) break
+              new_common = i
+            }
+            common_n = new_common
+          }
+          END {
+            if (common_n == 0) { print "."; exit }
+            out = prefix[1]
+            for (i = 2; i <= common_n; i++) out = out "/" prefix[i]
+            print out
+          }
+        '
+      }
+
+      enriched=()
+      while IFS= read -r pr; do
+        num=$(echo "$pr" | jq -r '.number')
+        files=$(gh pr diff "$num" --name-only 2>/dev/null || true)
+        if [ -z "$files" ]; then
+          folder="."
+        else
+          folder=$(echo "$files" | common_prefix)
+        fi
+        enriched+=("$(echo "$pr" | jq --arg f "$folder" '. + {project_folder: $f}')")
+      done < <(echo "$PRS_JSON" | jq -c '.[]')
+
+      printf '%s\n' "${enriched[@]}" | jq -s '.'
+    timeout: 60000
+
+  # ── Step 5: Loop over the PRs and process each one ─────────────────────
+  - id: process-dependabot-prs
+    depends_on: [gate-process, identify-project-folders]
+    when: "$gate-process.output == 'PROCEED'"
+    loop:
+      prompt: |
+        You are processing Dependabot pull requests for this repository.
+
+        Target list (JSON array of PRs, each enriched with `project_folder`):
+        $identify-project-folders.output
+
+        Each PR object includes a `project_folder` field — the deepest
+        common directory of the PR's changed files. For example, a PR
+        bumping a dep in `examples/ts-charting-library/frontend/package.json`
+        will have `project_folder = "examples/ts-charting-library/frontend"`.
+        Use this when reasoning about scope, but do not act on it directly
+        in this workflow (downstream workflows will).
+
+        For EACH PR in the JSON array, perform these steps in order:
+
+        ### Step 1: Extract bump type
+        Parse the PR title to determine the semver bump type. Dependabot
+        titles typically follow "Bump <package> from <old> to <new>".
+        Compare the versions:
+        - Only PATCH changed (e.g., 1.2.3 → 1.2.4) → bump_type = "patch"
+        - MINOR changed (e.g., 1.2.3 → 1.3.0)     → bump_type = "minor"
+        - MAJOR changed (e.g., 1.2.3 → 2.0.0)     → bump_type = "major"
+        - If you cannot determine from the title, run
+          `gh pr diff <number> --name-only` and inspect the lockfile to infer.
+        - Default to "ambiguous" if you truly cannot tell (e.g. a grouped /
+          multi-package bump). "ambiguous" is escalated to human review, NOT
+          auto-merged.
+
+        ### Step 2: Check for merge conflicts
+        Look at the "mergeable" field in the PR JSON:
+        - "MERGEABLE"   → no conflicts, proceed
+        - "CONFLICTING" → has conflicts
+        - "UNKNOWN"     → not computed yet; re-check with
+                          `gh pr view <number> --json mergeable`
+
+        If the PR has merge conflicts:
+        - `gh pr comment <number> --body "⚠️ This Dependabot PR has merge conflicts and cannot be auto-merged. Please rebase or resolve conflicts manually."`
+        - Skip to the next PR (do NOT approve or merge).
+
+        ### Step 3: Check CI status
+        Look at "statusCheckRollup" in the PR JSON, or run
+        `gh pr checks <number>`.
+        - Any required check FAILED → skip this PR.
+        - Checks PENDING → `gh pr checks <number> --watch --fail-fast`
+          (waits up to 10 min). If they ultimately fail, skip.
+        - Only proceed if ALL checks have PASSED.
+
+        ### Step 4: Act based on bump type
+        **Patch, minor, OR major** (CI green, no conflicts):
+        Policy: passing CI (lint, test, build — every required check) is the
+        merge gate. Major bumps are auto-merged too, not escalated.
+        1. `gh pr review <number> --approve --body "Auto-approved: dependabot {{bump_type}} bump (all required CI checks green)."`
+        2. `gh pr merge <number> --squash --auto --delete-branch`
+        3. Report: "PR #<number>: auto-approved and merged ({{bump_type}} bump)"
+
+        **Ambiguous** (couldn't classify the bump; CI green, no conflicts):
+        1. Do NOT approve or merge.
+        2. `gh pr comment <number> --body "🔍 **Human review required.** Couldn't determine the version-bump type for this PR (possibly a grouped/multi-package update). Please review and merge manually if it looks safe."`
+        3. Report: "PR #<number>: ambiguous bump — requested human review"
+
+        ### Important rules
+        - Process every PR in the list, one at a time.
+        - Never force-merge or bypass checks.
+        - If a `gh` command fails, report the error and move to the next PR.
+        - After processing ALL PRs, output `DEPENDABOT_PROCESSING_COMPLETE`
+          to signal completion.
+      until: DEPENDABOT_PROCESSING_COMPLETE
+      max_iterations: 50
+      fresh_context: false

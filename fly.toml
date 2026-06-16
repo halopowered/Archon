@@ -1,0 +1,53 @@
+# fly.toml app configuration file generated for archon-sandbox on 2026-06-11T14:59:14-06:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'archon-sandbox'
+primary_region = 'ord'
+
+[build]
+
+[env]
+  # Archon's server defaults to port 3090 when PORT is unset (Fly does not
+  # inject PORT automatically) — must match http_service.internal_port.
+  PORT = '3000'
+  # Fly runs Firecracker microVMs, not Docker, so Archon's isDocker() probe
+  # (which looks for WORKSPACE_PATH / HOME=/root) is false here and ARCHON_HOME
+  # would fall back to ~/.archon (/home/appuser/.archon). The image + entrypoint
+  # are built entirely around /.archon (workspaces, worktrees, git
+  # safe.directory, the webhook-host workflow copy + repo clone), so pin it.
+  ARCHON_DOCKER = 'true'
+  # Repos the webhook-host acts on. The entrypoint clones each into
+  # /.archon/checkouts/<repo>; the dependabot server routes each incoming PR to
+  # its own checkout by repository.full_name. Space/comma-separated owner/repo.
+  # Add a repo here + redeploy to extend coverage.
+  WEBHOOK_TARGET_REPOS = 'halopowered/stack-artifacts'
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  # Webhook receivers (the webhook-host subsystem) run on this same machine and
+  # must not miss deliveries, so keep one machine always on (no idle-stop).
+  auto_stop_machines = 'off'
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ['app']
+
+# Second public service for the webhook-host dispatcher. Fly terminates TLS at
+# the edge on :8443 and forwards to the dispatcher on internal port 9000, which
+# path-routes to each webhook server (e.g. /dependabot). GitHub webhook URLs
+# support custom ports: https://archon-sandbox.fly.dev:8443/dependabot
+[[services]]
+  internal_port = 9000
+  protocol = 'tcp'
+  processes = ['app']
+
+  [[services.ports]]
+    port = 8443
+    handlers = ['tls', 'http']
+
+[[vm]]
+  memory = '1gb'
+  cpus = 1
+  memory_mb = 1024

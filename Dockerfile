@@ -72,6 +72,8 @@ RUN apt-get update && apt-get install -y \
     gnupg \
     gosu \
     postgresql-client \
+    # jq: required by the webhook-host dependabot workflows (JSON parsing)
+    jq \
     # Chromium for agent-browser E2E testing (drives browser via CDP)
     chromium \
     && rm -rf /var/lib/apt/lists/*
@@ -86,9 +88,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
 
 # Install agent-browser CLI (Vercel Labs) for E2E testing workflows
 # - Uses npm (not bun) because postinstall script downloads the native Rust binary
-# - After install, symlink the Rust binary directly and purge nodejs/npm (~60MB saved)
-# - The npm entry point is a Node.js wrapper; the native binary works standalone
+# - After install, symlink the Rust binary directly so it works standalone
 # - agent-browser auto-detects Docker (via /.dockerenv) and adds --no-sandbox to Chromium
+#
+# NOTE: nodejs/npm are intentionally KEPT (not purged) — the webhook-host
+# dependabot workflows (verify-and-merge, auto-fix-install) run `npm ci`,
+# `npm install`, `npm run build`, and `npm test` on target-repo PR branches.
 RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
     && npm install -g agent-browser@0.22.1 \
     && NATIVE_BIN=$(find /usr/local/lib/node_modules/agent-browser -name 'agent-browser-*' -type f -executable 2>/dev/null | head -1) \
@@ -101,8 +106,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
        fi \
     && npm cache clean --force \
     && rm -rf /usr/local/lib/node_modules/agent-browser \
-    && apt-get purge -y nodejs npm \
-    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Point agent-browser to system Chromium (avoids ~400MB Chrome for Testing download)
@@ -161,6 +164,11 @@ COPY .archon/ ./.archon/
 COPY migrations/ ./migrations/
 COPY tsconfig*.json ./
 
+# Webhook-host subsystem: supervisor + per-server webhook listeners, plus the
+# Archon workflow YAMLs they trigger (copied into /.archon/workflows at boot by
+# docker-entrypoint.sh). See deploy/webhook-host/README.md.
+COPY deploy/ ./deploy/
+
 # Fix permissions for appuser
 RUN chown -R appuser:appuser /app
 
@@ -179,7 +187,19 @@ COPY docker-entrypoint.sh /usr/local/bin/
 RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
     && chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# Expose the `archon` CLI on PATH. A thin wrapper execs the CLI source already
+# baked into the image, so it always matches the server version + DB schema (no
+# released-binary drift, no network fetch). Runs the script directly (not via
+# `bun --cwd`) so module resolution finds the hoisted /app/node_modules while
+# process.cwd() stays as the caller's directory — required for workflow commands
+# that resolve the git repo from cwd (e.g. inside worktrees).
+RUN printf '#!/bin/bash\nexec bun /app/packages/cli/src/cli.ts "$@"\n' > /usr/local/bin/archon \
+    && chmod +x /usr/local/bin/archon
+
 # Default port (matches .env.example PORT=3000)
 EXPOSE 3000
+
+# Webhook-host dispatcher port (Fly maps the public :8443 edge to this).
+EXPOSE 9000
 
 ENTRYPOINT ["docker-entrypoint.sh"]

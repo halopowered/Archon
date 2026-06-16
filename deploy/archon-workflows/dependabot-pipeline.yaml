@@ -1,0 +1,383 @@
+name: dependabot-pipeline
+description: |
+  Use when: You want the full pipeline run end-to-end against one or more
+  Dependabot PRs:
+    1. identify project folder
+    2. ensure folder is at L2 readiness (open + auto-merge fix PR if not)
+    3. verify the PR (install + build + test) and merge if patch/minor
+    4. on install failure, attempt the Tier-1 mechanical fix
+
+  Triggers (run): "dependabot pipeline", "full pipeline", "process and merge",
+                  "end-to-end dependabot".
+
+  Input (from $ARGUMENTS): same routing as dependabot-fix-check —
+    - PR number ("57", "#57", "PR 57") → process just that PR
+    - Dependency name ("vite", "lodash") → look up matching open Dependabot
+      PR by title; 0 matches no-op, 1 match processes, >1 asks to clarify
+    - "all" / "every" / "sweep" → process every open Dependabot PR
+    - Empty / unclear → ask for clarification and stop
+
+  Pipeline behavior per PR (sequential):
+    - readiness-check is run once per UNIQUE project folder per pipeline run
+      (deduped). If readiness fails or can't reach L2, that PR's verify
+      step is skipped.
+    - verify-and-merge runs after readiness succeeds.
+    - If verify reports VERIFY_FAILED_INSTALL, auto-fix-install is invoked
+      to attempt a Tier-1 lockfile-regeneration fix.
+    - Per-PR results aggregated into a final summary.
+
+  NOT for: Reviewing existing PRs, partial-pipeline invocations (use the
+           leaf workflows directly instead), parallel sweeps (this MVP is
+           sequential).
+
+nodes:
+  # ── Step 1: Classify the user's intent ───────────────────────────────
+  - id: classify-input
+    prompt: |
+      You are the input classifier for the `dependabot-pipeline` workflow.
+
+      User input: $ARGUMENTS
+
+      Decide which of these modes applies and output structured JSON.
+
+      Modes:
+      - "all"               — user asked to process every open Dependabot PR
+                              (phrases like "all", "every", "all of them",
+                               "sweep", "run on all").
+      - "single-by-number"  — user gave a PR number (e.g., "57", "#57",
+                               "PR 57", "pull request 57"). Extract the number.
+      - "single-by-name"    — user gave a dependency or package name to match
+                               against PR titles (e.g., "vite",
+                               "angular-devkit", "lodash", "the vite one").
+                               Capture the bare search term.
+      - "ambiguous"         — input is empty, unclear, self-contradictory,
+                               or doesn't fit any pattern above.
+
+      Always output both `pr_number` and `search_term`, using "" when unused.
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [all, single-by-number, single-by-name, ambiguous]
+        pr_number:
+          type: string
+        search_term:
+          type: string
+      required: [mode, pr_number, search_term]
+
+  - id: ask-for-clarification
+    depends_on: [classify-input]
+    when: "$classify-input.output.mode == 'ambiguous'"
+    bash: |
+      cat <<'EOF'
+      Clarification needed.
+
+      Tell me one of:
+        • A PR number           — e.g. "PR 57" or "#57"
+        • A dependency name     — e.g. "vite", "lodash", "angular-devkit"
+        • "all"                 — to process every open Dependabot PR
+
+      Re-run the workflow with one of the above.
+      EOF
+    timeout: 5000
+
+  # ── Step 2: Build the list of PRs to process ─────────────────────────
+  - id: build-pr-list
+    depends_on: [classify-input]
+    when: "$classify-input.output.mode != 'ambiguous'"
+    bash: |
+      #!/bin/bash
+      set -eu
+
+      MODE=$classify-input.output.mode
+      PR_NUMBER=$classify-input.output.pr_number
+      SEARCH_TERM=$classify-input.output.search_term
+
+      PR_FIELDS='number,title,author,mergeable,statusCheckRollup'
+
+      case "$MODE" in
+        all)
+          prs=$(gh pr list \
+            --author "app/dependabot" \
+            --state open \
+            --json "$PR_FIELDS" \
+            --limit 100)
+          count=$(echo "$prs" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            echo "EMPTY"
+          else
+            echo "$prs"
+          fi
+          ;;
+
+        single-by-number)
+          if [ -z "$PR_NUMBER" ]; then
+            echo "NOT_A_DEPENDABOT_PR"; exit 0
+          fi
+          if ! pr=$(gh pr view "$PR_NUMBER" --json "$PR_FIELDS" 2>/dev/null); then
+            echo "NOT_A_DEPENDABOT_PR"; exit 0
+          fi
+          author=$(echo "$pr" | jq -r '.author.login')
+          case "$author" in
+            'dependabot[bot]'|app/dependabot|dependabot)
+              echo "[$pr]"
+              ;;
+            *)
+              echo "NOT_A_DEPENDABOT_PR"
+              ;;
+          esac
+          ;;
+
+        single-by-name)
+          if [ -z "$SEARCH_TERM" ]; then
+            echo "EMPTY"; exit 0
+          fi
+          matches=$(gh pr list \
+            --author "app/dependabot" \
+            --state open \
+            --search "$SEARCH_TERM in:title" \
+            --json "$PR_FIELDS" \
+            --limit 10)
+          count=$(echo "$matches" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            echo "EMPTY"
+          elif [ "$count" -eq 1 ]; then
+            echo "$matches"
+          else
+            echo "$matches" \
+              | jq -r '.[] | "  #\(.number)  \(.title)"' \
+              > "$ARTIFACTS_DIR/name-match-candidates.txt"
+            echo "MULTIPLE_NAME_MATCHES"
+          fi
+          ;;
+
+        *)
+          echo "EMPTY"
+          ;;
+      esac
+    timeout: 30000
+
+  - id: report-not-dependabot
+    depends_on: [classify-input, build-pr-list]
+    when: "$build-pr-list.output == 'NOT_A_DEPENDABOT_PR'"
+    bash: |
+      PR_NUMBER=$classify-input.output.pr_number
+      if [ -z "$PR_NUMBER" ]; then
+        PR_REF="(no number provided)"
+      else
+        PR_REF="#$PR_NUMBER"
+      fi
+      cat <<EOF
+      PR $PR_REF is not a Dependabot PR (or doesn't exist on this repository).
+
+      The pipeline only operates on Dependabot-authored PRs.
+      EOF
+    timeout: 5000
+
+  - id: report-multi-match
+    depends_on: [classify-input, build-pr-list]
+    when: "$build-pr-list.output == 'MULTIPLE_NAME_MATCHES'"
+    bash: |
+      SEARCH_TERM=$classify-input.output.search_term
+      echo "Multiple open Dependabot PRs matched \"$SEARCH_TERM\"."
+      echo ""
+      echo "Candidates:"
+      [ -f "$ARTIFACTS_DIR/name-match-candidates.txt" ] && \
+        cat "$ARTIFACTS_DIR/name-match-candidates.txt"
+      echo ""
+      echo "Re-run with a specific PR number or a more specific name."
+    timeout: 5000
+
+  # ── Step 3: Gate the rest of the pipeline ────────────────────────────
+  - id: gate-process
+    depends_on: [classify-input, build-pr-list]
+    when: "$classify-input.output.mode != 'ambiguous'"
+    bash: |
+      OUTPUT=$build-pr-list.output
+      case "$OUTPUT" in
+        EMPTY|NOT_A_DEPENDABOT_PR|MULTIPLE_NAME_MATCHES|"")
+          echo "SKIP"
+          ;;
+        *)
+          echo "PROCEED"
+          ;;
+      esac
+    timeout: 5000
+
+  # ── Step 4: Annotate each PR with its project folder ─────────────────
+  - id: identify-project-folders
+    depends_on: [build-pr-list, gate-process]
+    when: "$gate-process.output == 'PROCEED'"
+    bash: |
+      #!/bin/bash
+      set -eu
+
+      PRS_JSON=$build-pr-list.output
+
+      common_prefix() {
+        awk -F/ '
+          NR == 1 {
+            common_n = NF - 1
+            for (i = 1; i <= common_n; i++) prefix[i] = $i
+            next
+          }
+          {
+            max_check = (NF - 1 < common_n ? NF - 1 : common_n)
+            new_common = 0
+            for (i = 1; i <= max_check; i++) {
+              if (prefix[i] != $i) break
+              new_common = i
+            }
+            common_n = new_common
+          }
+          END {
+            if (common_n == 0) { print "."; exit }
+            out = prefix[1]
+            for (i = 2; i <= common_n; i++) out = out "/" prefix[i]
+            print out
+          }
+        '
+      }
+
+      enriched=()
+      while IFS= read -r pr; do
+        num=$(echo "$pr" | jq -r '.number')
+        files=$(gh pr diff "$num" --name-only 2>/dev/null || true)
+        if [ -z "$files" ]; then
+          folder="."
+        else
+          folder=$(echo "$files" | common_prefix)
+        fi
+        enriched+=("$(echo "$pr" | jq --arg f "$folder" '. + {project_folder: $f}')")
+      done < <(echo "$PRS_JSON" | jq -c '.[]')
+
+      printf '%s\n' "${enriched[@]}" | jq -s '.'
+    timeout: 60000
+
+  # ── Step 5: The orchestrator — sequential per-PR pipeline ────────────
+  # For each PR (in the order returned by build-pr-list):
+  #   readiness-check  (deduped per project_folder)
+  #   verify-and-merge (always, unless readiness blocked)
+  #   auto-fix-install (only if verify reported VERIFY_FAILED_INSTALL)
+  #
+  # Each sub-workflow's last node is `report-status`, which emits a
+  # `<<<STATUS:NAME>>>` marker line. We grep for that marker to capture
+  # the result; log noise interleaved by Archon doesn't interfere.
+  - id: orchestrate
+    depends_on: [identify-project-folders, gate-process]
+    when: "$gate-process.output == 'PROCEED'"
+    bash: |
+      #!/bin/bash
+      set -uo pipefail
+
+      ENRICHED=$identify-project-folders.output
+
+      # Unique tag per orchestrator run, used as a prefix for sub-workflow
+      # branch names. Without this, Archon's workflow-run-ID is keyed by
+      # (workflow-name + branch), so deterministic branch names cause
+      # resumed runs that reuse cached node outputs from prior failures.
+      RUN_TAG=$(echo "$WORKFLOW_ID" | tr -dc '[:alnum:]' | head -c 8)
+
+      extract_sentinel() {
+        # Echoes the LAST sentinel found in the captured output.
+        # tr -d '[:space:]' guards against trailing whitespace.
+        echo "$1" \
+          | grep -oE '<<<STATUS:[A-Z0-9_]+>>>' \
+          | tail -1 \
+          | sed -E 's/^<<<STATUS:|>>>$//g' \
+          | tr -d '[:space:]'
+      }
+
+      run_sub() {
+        # $1 = workflow name, $2 = branch suffix, $3 = arguments
+        local wf="$1"
+        local branch="$2"
+        local args="$3"
+        echo "──────────────────────────────────────────"
+        echo " ▶ archon workflow run $wf  ($args)"
+        echo "──────────────────────────────────────────"
+        local out
+        out=$(archon workflow run "$wf" \
+              --branch "$branch" \
+              "$args" 2>&1) || true
+        # Echo the sub-workflow's stdout for debugging.
+        echo "$out"
+        # Return the parsed sentinel via stdout (last line consumers read).
+        local sentinel
+        sentinel=$(extract_sentinel "$out")
+        echo ""
+        echo "──────── sub-result: ${sentinel:-UNKNOWN} ────────"
+        echo "$sentinel" > "$ARTIFACTS_DIR/.last-sentinel"
+      }
+
+      # Track folders we've already run readiness for (string-based dedup).
+      SEEN_FOLDERS=""
+
+      RESULTS_FILE="$ARTIFACTS_DIR/pipeline-results.txt"
+      : > "$RESULTS_FILE"
+
+      while IFS= read -r pr; do
+        num=$(echo "$pr" | jq -r '.number')
+        folder=$(echo "$pr" | jq -r '.project_folder')
+
+        echo ""
+        echo "════════ PR #$num  ($folder) ════════"
+
+        # ── Step 2 of pipeline: readiness-check (deduped per folder) ──
+        readiness_status=""
+        if echo "$SEEN_FOLDERS" | grep -qFx "$folder"; then
+          readiness_status="READINESS_CACHED"
+          echo "↺ readiness already established for $folder this run; skipping."
+        else
+          run_sub readiness-check \
+            "run/$RUN_TAG-readiness-${folder//\//-}" \
+            "$folder"
+          readiness_status=$(cat "$ARTIFACTS_DIR/.last-sentinel")
+          SEEN_FOLDERS="$SEEN_FOLDERS"$'\n'"$folder"
+        fi
+
+        # ── Decide whether to proceed to verify ─────────────────────
+        case "$readiness_status" in
+          READINESS_ALREADY_L2|READINESS_PR_MERGED|READINESS_CACHED) ;;
+          *)
+            echo "❌ Readiness blocked ($readiness_status); skipping verify for PR #$num."
+            echo "PR #$num: readiness=$readiness_status, verify=skipped, autofix=skipped" \
+              >> "$RESULTS_FILE"
+            continue
+            ;;
+        esac
+
+        # ── Step 3a of pipeline: verify-and-merge ───────────────────
+        run_sub verify-and-merge \
+          "run/$RUN_TAG-verify-pr-$num" \
+          "$num"
+        verify_status=$(cat "$ARTIFACTS_DIR/.last-sentinel")
+
+        autofix_status="not-attempted"
+
+        # ── Step 3b: Tier-1 install autofix ─────────────────────────
+        if [ "$verify_status" = "VERIFY_FAILED_INSTALL" ]; then
+          echo "🛠️  Install failure — attempting Tier-1 auto-fix for PR #$num"
+          run_sub auto-fix-install \
+            "run/$RUN_TAG-autofix-pr-$num" \
+            "$num"
+          autofix_status=$(cat "$ARTIFACTS_DIR/.last-sentinel")
+        fi
+
+        echo "PR #$num: readiness=$readiness_status, verify=$verify_status, autofix=$autofix_status" \
+          >> "$RESULTS_FILE"
+
+      done < <(echo "$ENRICHED" | jq -c '.[]')
+
+      echo ""
+      echo "════════════════ PIPELINE SUMMARY ════════════════"
+      if [ -s "$RESULTS_FILE" ]; then
+        cat "$RESULTS_FILE"
+      else
+        echo "(no PRs processed)"
+      fi
+      echo "═════════════════════════════════════════════════"
+    timeout: 36000000

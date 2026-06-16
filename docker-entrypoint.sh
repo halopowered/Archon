@@ -84,6 +84,40 @@ if [ -z "${CLAUDE_BIN_PATH:-}" ]; then
   unset _CLAUDE_BIN_CANDIDATE
 fi
 
+# --- webhook-host bootstrap (background) -----------------------------------
+# Run the webhook listener subsystem (deploy/webhook-host) alongside the main
+# Archon server. Gated on GITHUB_WEBHOOK_SECRET so we don't restart-loop a
+# child that requires it. Runs as appuser ($RUNNER) and is backgrounded so it
+# never delays the main server's boot/healthcheck.
+#
+# Steps (in the child): copy the webhook workflow YAMLs into the globally
+# discovered ~/.archon/workflows; ensure a full checkout of each target repo
+# exists at /.archon/checkouts/<repo> (cwd for spawned `archon` runs; uses the
+# GH_TOKEN credential helper configured above); then exec the dispatcher.
+# /.archon is ephemeral here, so this re-runs every boot (idempotent).
+if [ -n "${GITHUB_WEBHOOK_SECRET:-}" ] && [ -d /app/deploy/webhook-host ]; then
+  echo "[archon] webhook-host: GITHUB_WEBHOOK_SECRET set — starting subsystem"
+  $RUNNER bash -c '
+    set -u
+    mkdir -p /.archon/workflows /.archon/checkouts
+    cp /app/deploy/archon-workflows/*.yaml /.archon/workflows/ 2>/dev/null \
+      && echo "[archon] webhook-host: copied workflow YAMLs to /.archon/workflows" \
+      || echo "[archon] webhook-host: WARN no workflow YAMLs to copy"
+    for repo in ${WEBHOOK_TARGET_REPOS:-halopowered/stack-artifacts}; do
+      name="${repo##*/}"; dest="/.archon/checkouts/$name"
+      if [ ! -d "$dest/.git" ]; then
+        echo "[archon] webhook-host: cloning $repo -> $dest"
+        git clone "https://github.com/$repo.git" "$dest" \
+          || echo "[archon] webhook-host: WARN clone of $repo failed (check GH_TOKEN scope/SSO)"
+      fi
+    done
+    echo "[archon] webhook-host: launching dispatcher on port ${WEBHOOK_HOST_PORT:-9000}"
+    exec bun /app/deploy/webhook-host/host.ts
+  ' &
+else
+  echo "[archon] webhook-host: disabled (no GITHUB_WEBHOOK_SECRET) — skipping"
+fi
+
 # Run setup-auth (exits after configuring Codex credentials), then exec the server
 # exec ensures bun is PID 1 and receives SIGTERM for graceful shutdown
 $RUNNER bun run setup-auth

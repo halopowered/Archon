@@ -1,0 +1,568 @@
+name: readiness-check
+description: |
+  Use when: You want to ensure a project folder meets Level 2 agentic
+  readiness against the inline 12-check rubric and, if not, automatically
+  close the gaps via a self-merging PR.
+
+  Triggers (run): "establish readiness", "readiness-check", "check L2",
+                  "make agent-ready", "agentic readiness".
+
+  Input (from $ARGUMENTS): a single project folder path relative to the
+  repo root, e.g. `examples/ts-charting-library/frontend`.
+
+  Does:
+  - Validates the input folder
+  - Assesses readiness against the 12-check rubric inlined in the
+    `assess-readiness` node prompt (4 checks per level, 3 levels)
+  - If at L2 or above: reports current level and stops
+  - If below L2:
+    1. Opens a fix branch from origin/main (`fix/readiness-<slug>`)
+    2. Generates the missing files (CLAUDE.md, CODEOWNERS, husky +
+       lint-staged config, etc.)
+    3. Commits, pushes, opens a PR
+    4. Squash-merges the PR (assumes the runner has perms to self-merge;
+       branch protections must allow it)
+
+  NOT for: Reviewing existing readiness PRs, fixing readiness gaps
+           interactively, or rewriting the rubric itself.
+
+nodes:
+  # ── Step 1: Validate the input folder ──────────────────────────────────
+  - id: validate-folder
+    bash: |
+      #!/bin/bash
+      FOLDER=$(echo "$ARGUMENTS" | awk '{$1=$1};1')
+      if [ -z "$FOLDER" ]; then
+        echo "Provide a project folder path (relative to repo root)." \
+          > "$ARTIFACTS_DIR/validation-error.txt"
+        echo "INVALID"; exit 0
+      fi
+      if [ ! -d "$FOLDER" ]; then
+        echo "Folder not found: $FOLDER" \
+          > "$ARTIFACTS_DIR/validation-error.txt"
+        echo "INVALID"; exit 0
+      fi
+      # At least one manifest must be present (generous check).
+      manifest_found=0
+      for m in package.json pyproject.toml setup.py requirements.txt \
+               Cargo.toml go.mod pom.xml build.gradle build.gradle.kts \
+               Gemfile composer.json; do
+        if [ -f "$FOLDER/$m" ]; then manifest_found=1; break; fi
+      done
+      if [ "$manifest_found" -eq 0 ] && \
+         ! ls "$FOLDER"/*.csproj 2>/dev/null | head -1 | grep -q .; then
+        echo "No manifest in $FOLDER (looked for package.json, pyproject.toml, Cargo.toml, go.mod, etc.)" \
+          > "$ARTIFACTS_DIR/validation-error.txt"
+        echo "INVALID"; exit 0
+      fi
+      echo "VALID"
+    timeout: 5000
+
+  - id: report-invalid-input
+    depends_on: [validate-folder]
+    when: "$validate-folder.output == 'INVALID'"
+    bash: |
+      echo "READINESS_INVALID_INPUT" > "$ARTIFACTS_DIR/status.txt"
+      echo "❌ readiness-check input invalid:"
+      echo ""
+      cat "$ARTIFACTS_DIR/validation-error.txt"
+      echo ""
+      echo "Usage:"
+      echo "  archon workflow run readiness-check --branch run/readiness 'examples/ts-charting-library/frontend'"
+    timeout: 5000
+
+  # ── Step 2: Assess current readiness against the inline rubric ────────
+  - id: assess-readiness
+    depends_on: [validate-folder]
+    when: "$validate-folder.output == 'VALID'"
+    prompt: |
+      You are the readiness auditor for the `readiness-check` workflow.
+      Apply the 12-check rubric below to the project folder: $ARGUMENTS
+
+      ─── Step A: Detect the project's primary language(s) / framework(s)
+
+      Look for these manifest files in the target folder (and at the repo
+      root for monorepo-shared signals):
+        - package.json                            → Node.js / JS / TS
+        - go.mod                                  → Go
+        - Cargo.toml                              → Rust
+        - pyproject.toml / setup.py /
+          requirements.txt / Pipfile              → Python
+        - Gemfile                                 → Ruby
+        - pom.xml / build.gradle / build.gradle.kts → Java / Kotlin
+        - *.csproj / *.sln                        → C# / .NET
+        - composer.json                           → PHP
+        - pubspec.yaml                            → Dart / Flutter
+
+      Use the detected stack to gate language-specific checks below.
+
+      ─── Step B: Run all 12 checks across all 3 levels
+
+      Even if Level 1 fails, run every Level 2 and Level 3 check too —
+      we need the full picture for the report and for `gaps_to_l2`.
+
+      ── Level 1 — Functional ──────────────────────────────────────
+
+      1.1 README.md exists
+        - Look for `README.md` / `README.*` / `readme.md` at the project root.
+        - PASS if any match has actual content (not empty).
+
+      1.2 Linter configured
+        - JS/TS: `.eslintrc*`, `eslint.config.*`, `biome.json`,
+          `biome.jsonc`, `.prettierrc*`, `deno.json`
+        - Python: `.pylintrc`, `.flake8`, or `[tool.ruff]` /
+          `[tool.pylint]` / `[tool.flake8]` in `pyproject.toml`
+        - Ruby: `.rubocop.yml`
+        - Go: `.golangci.yml` / `.golangci.yaml`
+        - Rust: `clippy.toml` / `.clippy.toml` / `rustfmt.toml`
+        - General: `.editorconfig` is also a valid linter signal.
+        - Also check `package.json` `devDependencies` for `eslint` /
+          `biome` / `oxlint` / `prettier`, and any `lint`-prefixed script.
+        - PASS if any linter signal is found.
+
+      1.3 Type checker active
+        - JS/TS: `tsconfig.json` / `tsconfig*.json` / `jsconfig.json`,
+          or `typescript` in `package.json` deps/devDeps.
+        - Python: `mypy.ini` / `.mypy.ini` / `pyrightconfig.json`, or
+          `[tool.mypy]` / `[tool.pyright]` / `[tool.pytype]` in
+          `pyproject.toml`.
+        - Languages with built-in static types automatically PASS:
+          Go (`go.mod`), Rust (`Cargo.toml`), Java/Kotlin (`pom.xml` /
+          `build.gradle*`), C# (`*.csproj` / `*.sln`).
+        - PASS if any type-checking signal is found.
+
+      1.4 Unit tests present
+        - Look for test files: `**/*.test.*`, `**/*.spec.*`,
+          `**/*_test.*`, `**/test_*.*`, or any of the dirs `__tests__/`,
+          `tests/`, `test/`, `spec/`. For Go also `**/*_test.go`.
+        - Verify a runner is configured:
+          - Node `package.json`: `jest` / `vitest` / `mocha` / `ava` /
+            `tap` / `@testing-library/*`
+          - Python: `pytest.ini`, `conftest.py`, `tox.ini`, or
+            `[tool.pytest]` in `pyproject.toml`
+          - Go: any `_test.go` file (built-in)
+          - Rust: `#[cfg(test)]` in source or a `tests/` directory
+        - PASS only if test files exist AND a runner is wired up. A
+          test file with NO real test content (no `it()` / `describe()` /
+          `def test_*`) does NOT count.
+
+      ── Level 2 — Documented ──────────────────────────────────────
+
+      2.1 Agent instructions exist
+        - Look for any of: `AGENTS.md`, `CLAUDE.md`, `.claude/CLAUDE.md`,
+          `CLAUDE.local.md`, `COPILOT.md`,
+          `.github/copilot-instructions.md`, `.cursorrules`, `CURSOR.md`,
+          `CODEX.md`, `AI.md`, or a `.ai/` directory with content.
+        - PASS if any of these is present with non-empty content.
+
+      2.2 Reproducible dev environment
+        - Container / dev-env signals: `Dockerfile`, `docker-compose.yml`
+          / `docker-compose.yaml` / `compose.yml` / `compose.yaml`,
+          `.devcontainer/devcontainer.json` / `.devcontainer.json`,
+          `flake.nix` / `shell.nix` / `default.nix`, `Vagrantfile`,
+          `mise.toml` / `.tool-versions` / `.rtx.toml`, `.envrc`.
+        - `Makefile` with `setup` / `install` / `dev` / `init` targets.
+        - Lockfiles count: `package-lock.json`, `yarn.lock`,
+          `pnpm-lock.yaml`, `poetry.lock`, `Pipfile.lock`, `Cargo.lock`,
+          `go.sum`.
+        - PASS if any reproducible-env signal is found.
+
+      2.3 Pre-commit hooks
+        - Files: `.pre-commit-config.yaml`, `.husky/`, `.husky/_/husky.sh`,
+          `lefthook.yml` / `.lefthook.yml`.
+        - `package.json` devDeps: `husky`, `lint-staged`, `lefthook`.
+        - A real `.git/hooks/pre-commit` (not the .sample template).
+        - PASS if any pre-commit mechanism is wired.
+
+      2.4 Branch protection
+        - `CODEOWNERS` / `.github/CODEOWNERS` / `docs/CODEOWNERS`.
+        - `.github/settings.yml` (probot) with branch-protection config.
+        - `.github/ruleset*.yml`.
+        - GitLab projects: merge-request approval config in `.gitlab/`.
+        - NOTE: Actual GitHub branch-protection rules require API access;
+          the filesystem signal above is a proxy. Note this in
+          `why_failed` if the file isn't found, but don't try to verify
+          via API.
+        - PASS if any of the above is present.
+
+      ── Level 3 — Standardized ────────────────────────────────────
+
+      3.1 E2E tests exist
+        - Configs: `cypress.config.*`, `playwright.config.*`.
+        - Dirs: `cypress/` (esp. `cypress/e2e/`), `playwright/`,
+          `tests/e2e/`, `e2e/`, `**/e2e/**`, `integration/`,
+          `**/integration/**`.
+        - Node deps: `cypress`, `playwright`, `@playwright/test`,
+          `selenium-webdriver`, `puppeteer`, `testcafe`.
+        - Python deps: `behave`, `selenium`, `playwright`.
+        - PASS only if an E2E framework is configured AND test files
+          actually live in those E2E dirs.
+
+      3.2 Docs maintained
+        - A `docs/` / `doc/` / `documentation/` directory with content.
+        - Doc-site frameworks: `mkdocs.yml`, `docusaurus.config.*`,
+          `_config.yml` (Jekyll), `book.toml` (mdbook).
+        - API docs: `swagger.json` / `swagger.yaml` /
+          `openapi.yaml` / `openapi.json` / `api-docs/`.
+        - Engineering meta: `CONTRIBUTING.md`, `ARCHITECTURE.md`,
+          `CHANGELOG.md`, `ADR/` / `adr/`.
+        - PASS if any of the above OR at least 2 of `CONTRIBUTING.md` /
+          `ARCHITECTURE.md` / `CHANGELOG.md` exist.
+
+      3.3 Security scanning
+        - Files: `.github/dependabot.yml` / `.github/dependabot.yaml`,
+          `.snyk` / `snyk.json`, `renovate.json` / `renovate.json5` /
+          `.renovaterc` / `.renovaterc.json`,
+          `sonar-project.properties`, `.trivyignore` / `trivy.yaml`.
+        - Grep `.github/workflows/*.yml` for scanner names: `codeql`,
+          `snyk`, `trivy`, `semgrep`, `sonarqube` / `sonar-scanner`,
+          `bandit`, `safety`, `npm audit`, `yarn audit`, `brakeman`,
+          `gosec`, `cargo-audit`.
+        - PASS if any security tool is wired up.
+
+      3.4 Observability
+        - Look in dependency files for monitoring / logging libraries:
+          - Node `package.json`: `winston`, `pino`, `bunyan`, `log4js`,
+            `@sentry/node`, `sentry`, `dd-trace`, `datadog`, `newrelic`,
+            `@opentelemetry/*`, `elastic-apm-node`, `prometheus-client`.
+          - Python: `sentry-sdk`, `datadog`, `ddtrace`,
+            `opentelemetry-*`, `structlog`, `loguru`,
+            `python-json-logger`, `newrelic`.
+          - Go (`go.mod`): `go.opentelemetry.io`, `github.com/sirupsen/logrus`,
+            `go.uber.org/zap`, `github.com/rs/zerolog`,
+            `github.com/getsentry/sentry-go`.
+          - Ruby (`Gemfile`): `sentry-ruby`, `datadog`, `newrelic_rpm`,
+            `lograge`.
+        - Config files: `sentry.properties`, `newrelic.yml`,
+          `datadog.yaml`.
+        - PASS if any structured-logging or monitoring framework is in
+          deps.
+
+      ─── Step C: Detection guidelines
+
+      - The input is a SUB-FOLDER in a monorepo. Always check both the
+        target folder AND the repository root for shared signals
+        (CODEOWNERS, `.github/dependabot.yml`, `.pre-commit-config.yaml`).
+      - Be GENEROUS: if any signal of a tool/practice exists, count it as
+        PASS.
+      - But do NOT count empty directories, placeholder files, or sample
+        configs (e.g., `.git/hooks/pre-commit.sample`). Verify real
+        content.
+      - Language-aware gating: only flag missing tools relevant to the
+        detected stack (don't fail a Go project for missing `tsconfig`).
+
+      ─── Step D: Determine the overall level
+
+      A level is "passed" only if ALL its checks pass.
+      - Level 0: Level 1 is incomplete.
+      - Level 1: All four L1 checks pass; L2 incomplete.
+      - Level 2: All L1 and all L2 checks pass; L3 incomplete.
+      - Level 3: All checks across all 3 levels pass.
+
+      ─── Step E: Output the structured assessment
+
+      Output JSON with:
+      - level: integer 0-3 (the highest fully-passed level)
+      - at_l2_or_above: "yes" or "no"
+      - gaps_to_l2: array of {check_id, name, why_failed} for each L1
+        and L2 check that failed. Omit checks that already pass; omit
+        L3 gaps entirely (this workflow only remediates to L2).
+      - detected_stack: short string, e.g. "Angular 17 / TypeScript 5.4"
+      - summary: one-paragraph plain-English assessment.
+    model: sonnet
+    output_format:
+      type: object
+      properties:
+        level:
+          type: integer
+          minimum: 0
+          maximum: 3
+        at_l2_or_above:
+          type: string
+          enum: ["yes", "no"]
+        gaps_to_l2:
+          type: array
+          items:
+            type: object
+            properties:
+              check_id: { type: string }
+              name: { type: string }
+              why_failed: { type: string }
+            required: [check_id, name, why_failed]
+        detected_stack:
+          type: string
+        summary:
+          type: string
+      required: [level, at_l2_or_above, gaps_to_l2, detected_stack, summary]
+
+  # ── Step 3a: Already at L2 — report and stop ──────────────────────────
+  - id: report-already-l2
+    depends_on: [assess-readiness]
+    when: "$assess-readiness.output.at_l2_or_above == 'yes'"
+    bash: |
+      echo "READINESS_ALREADY_L2" > "$ARTIFACTS_DIR/status.txt"
+      FOLDER="$ARGUMENTS"
+      STACK=$assess-readiness.output.detected_stack
+      LEVEL=$assess-readiness.output.level
+      SUMMARY=$assess-readiness.output.summary
+
+      cat <<EOF
+      ✅ Project folder is already at L2 or above. No PR needed.
+
+      Folder:         $FOLDER
+      Detected stack: $STACK
+      Current level:  $LEVEL
+
+      Summary:
+      $SUMMARY
+      EOF
+    timeout: 5000
+
+  # ── Step 3b: Below L2 — open a fix branch from main ───────────────────
+  - id: create-fix-branch
+    depends_on: [assess-readiness]
+    when: "$assess-readiness.output.at_l2_or_above == 'no'"
+    bash: |
+      set -e
+      FOLDER="$ARGUMENTS"
+      # Slugify: '/' and '.' → '-', lowercase
+      SLUG=$(echo "$FOLDER" \
+        | tr '/' '-' \
+        | tr '.' '-' \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed 's/^-//; s/-$//')
+      BRANCH="fix/readiness-$SLUG"
+
+      # Redirect both stdout and stderr so only the final `echo` reaches the
+      # node's captured output. `git checkout -B X origin/main` may print
+      # tracking-setup messages to stdout in some environments, which would
+      # contaminate $create-fix-branch.output downstream.
+      git fetch origin main >/dev/null 2>&1
+      git checkout -B "$BRANCH" origin/main >/dev/null 2>&1
+
+      echo "$BRANCH"
+    timeout: 30000
+
+  # ── Step 4: Generate the L1 / L2 fix files ────────────────────────────
+  - id: generate-fixes
+    depends_on: [assess-readiness, create-fix-branch]
+    when: "$assess-readiness.output.at_l2_or_above == 'no'"
+    prompt: |
+      You are the auto-fix step for the `readiness-check` workflow.
+
+      Project folder: $ARGUMENTS
+      Working branch: $create-fix-branch.output (already checked out)
+
+      Detected stack:
+      $assess-readiness.output.detected_stack
+
+      Full readiness assessment (includes the gaps_to_l2 array):
+      $assess-readiness.output
+
+      For EACH gap in `gaps_to_l2`, write the file(s) needed to close it.
+
+      Per-check fix instructions (L1 and L2):
+
+      - 1.1 README:             write `README.md` inside the project folder
+                                with: project name, one-line description
+                                derived from the package manifest (or the
+                                folder's purpose if no manifest description),
+                                prerequisites, dev commands (build / test /
+                                lint), and a directory map of `src/`.
+
+      - 1.2 Linter:             write a language-appropriate config inside
+                                the project folder (NOT at repo root):
+                                  • JS / TS:  `eslint.config.js` (flat
+                                    config) or `.eslintrc.json`. For
+                                    Angular + TS specifically, prefer
+                                    `@angular-eslint`.
+                                  • Python:   `[tool.ruff]` in
+                                    `pyproject.toml`, or `ruff.toml`.
+                                  • Go:       `.golangci.yml`.
+                                  • Rust:     `rustfmt.toml` plus
+                                    `clippy.toml`.
+                                Add the linter package + a `lint` script
+                                to the project's manifest.
+
+      - 1.3 Type checker:       `tsconfig.json` for JS / TS (with
+                                `"strict": true`). For Python: `mypy.ini`
+                                or `[tool.mypy]` in `pyproject.toml`.
+                                Skip if the language has built-in types
+                                (Go, Rust, Java, C#).
+
+      - 1.4 Unit tests:         scaffold ONE real test that exercises an
+                                existing component / module of the project,
+                                not an empty placeholder. Install the
+                                framework if not already a dep
+                                (`vitest` or `jest` for Node, `pytest`
+                                for Python; Go, Rust, Java, and C# have
+                                built-in test runners). Add a `test`
+                                script to the manifest.
+
+      - 2.1 Agent instructions: write `CLAUDE.md` inside the project folder
+                                with: project overview, tech stack,
+                                directory layout, dev commands,
+                                conventions, testing notes.
+
+      - 2.2 Reproducible env:   ensure a lockfile exists. If it does not,
+                                note that and stop short of running an
+                                install — the next node owns git and any
+                                follow-up install. Optionally add a
+                                `Makefile` with `setup` / `dev` / `test` /
+                                `lint` targets.
+
+      - 2.3 Pre-commit hooks:
+                                  • Node:    husky v9 + lint-staged.
+                                      - add `husky` and `lint-staged` to
+                                        `devDependencies`
+                                      - add `"prepare": "husky"` to
+                                        `scripts`
+                                      - add a `lint-staged` config block
+                                        to `package.json`
+                                      - write `.husky/pre-commit` as a
+                                        single line, e.g. `npx lint-staged`
+                                  • Python / Go: write
+                                    `.pre-commit-config.yaml` with the
+                                    language's standard hooks (ruff,
+                                    golangci-lint, etc.).
+
+      - 2.4 Branch protection:  write `.github/CODEOWNERS` at the
+                                repository root (NOT inside the project
+                                folder). Add a path-specific rule for the
+                                project folder; default catch-all owner
+                                derived from the git remote (e.g.
+                                `@<org>/engineering` if origin is
+                                `github.com:<org>/<repo>`).
+
+      Hard rules:
+      - NEVER overwrite an existing file. If a target file already exists,
+        skip that check and note it in your final summary as already
+        present.
+      - Match the detected stack — do not write configs for languages
+        that aren't in the project (e.g. no Rust configs in a Node
+        project).
+      - Use the project's detected package manager (npm vs pnpm vs yarn
+        for Node; pip vs poetry vs uv for Python). Don't hardcode `npm`
+        if the project uses something else.
+      - Use the Write / Edit tools for file changes; use Bash only for
+        `chmod +x` on hook scripts.
+      - Do NOT run `npm install`, `pip install`, `git add`, `git commit`,
+        or `git push` — those are handled by the next node.
+
+      When you finish, end your response with a markdown bullet list of
+      every file you wrote or modified, prefixed with the check_id it
+      addresses (e.g. `- 2.1 → CLAUDE.md`). Include any checks you
+      skipped because the target file already existed.
+    model: sonnet
+    allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
+
+  # ── Step 5: Commit, push, open PR, and self-merge ─────────────────────
+  - id: commit-push-pr-merge
+    depends_on: [generate-fixes, create-fix-branch, assess-readiness]
+    when: "$assess-readiness.output.at_l2_or_above == 'no'"
+    bash: |
+      set -e
+      # Provisional status — overwritten on success at the end of this node.
+      echo "READINESS_FAILED" > "$ARTIFACTS_DIR/status.txt"
+
+      BRANCH=$create-fix-branch.output
+      FOLDER="$ARGUMENTS"
+      STACK=$assess-readiness.output.detected_stack
+
+      git add -A
+      if git diff --cached --quiet; then
+        echo "❌ No changes to commit. generate-fixes produced no files."
+        echo "   (All flagged gaps may already have files in place — "
+        echo "   re-run assess-readiness to refresh.)"
+        exit 1
+      fi
+
+      COMMIT_TITLE="chore: establish L2 agentic readiness in $FOLDER"
+
+      git commit -m "$COMMIT_TITLE" \
+                 -m "Closes L1 / L2 readiness gaps per the 12-check
+      rubric inlined in the readiness-check workflow.
+
+      Detected stack: $STACK
+      Auto-generated by the readiness-check Archon workflow."
+
+      git push -u origin "$BRANCH" >/dev/null 2>&1
+
+      # Build the PR body. Stored in a file so we can pass it to gh api
+      # via -F body=@<file> without inline escaping.
+      PR_BODY_FILE="$ARTIFACTS_DIR/pr-body.md"
+      {
+        echo "## Summary"
+        echo ""
+        echo "Auto-generated by the \`readiness-check\` Archon workflow to"
+        echo "close L1 / L2 readiness gaps in \`$FOLDER\`."
+        echo ""
+        echo "Detected stack: $STACK"
+        echo ""
+        echo "## Rubric"
+        echo ""
+        echo "12 filesystem-observable checks across 3 levels:"
+        echo ""
+        echo "**Level 1 — Functional:** README, linter, type checker,"
+        echo "unit tests."
+        echo ""
+        echo "**Level 2 — Documented:** agent instructions (CLAUDE.md /"
+        echo "AGENTS.md / etc.), reproducible dev env (lockfile / Docker"
+        echo "/ devcontainer / Makefile), pre-commit hooks (husky /"
+        echo "lint-staged / .pre-commit-config.yaml), branch protection"
+        echo "(CODEOWNERS / .github/settings.yml / ruleset)."
+        echo ""
+        echo "**Level 2 is the gate this workflow targets.** L3 checks"
+        echo "(E2E, docs maintained, security scanning, observability)"
+        echo "are assessed but not auto-fixed here."
+        echo ""
+        echo "Full rubric definitions live in the \`assess-readiness\`"
+        echo "node prompt of \`.archon/workflows/readiness-check.yaml\`."
+        echo ""
+        echo "## Files changed"
+        echo ""
+        git diff --name-only HEAD~1..HEAD | sed 's/^/- /'
+      } > "$PR_BODY_FILE"
+
+      OWNER_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+
+      # Create the PR via REST API directly. Avoids `gh pr create`'s
+      # internal git introspection, which conflicts with multi-worktree
+      # state ("main is already checked out at..." failures).
+      PR_JSON=$(gh api -X POST "repos/$OWNER_REPO/pulls" \
+        -f title="$COMMIT_TITLE" \
+        -F body=@"$PR_BODY_FILE" \
+        -f head="$BRANCH" \
+        -f base=main)
+      PR_NUMBER=$(echo "$PR_JSON" | jq -r '.number')
+      pr_url=$(echo "$PR_JSON" | jq -r '.html_url')
+      echo "📬 Opened PR: $pr_url (#$PR_NUMBER)"
+
+      # Squash-merge via API.
+      gh api -X PUT "repos/$OWNER_REPO/pulls/$PR_NUMBER/merge" \
+        -f merge_method=squash >/dev/null
+      echo "✅ Merged: $pr_url"
+
+      # Delete the branch on origin via API. We deliberately do NOT use
+      # `gh pr merge --delete-branch`, because that operation is what
+      # left prior worktrees stuck on `main` and broke later runs.
+      gh api -X DELETE "repos/$OWNER_REPO/git/refs/heads/$BRANCH" 2>/dev/null || true
+
+      echo "READINESS_PR_MERGED" > "$ARTIFACTS_DIR/status.txt"
+    timeout: 180000
+
+  # ── Final: emit the orchestrator-readable status marker ──────────────
+  # Depends on every terminal branch — whichever ran wrote status.txt.
+  # The marker format <<<STATUS:NAME>>> lets parents grep regardless of
+  # log noise interleaved with workflow stdout.
+  - id: report-status
+    depends_on: [report-invalid-input, report-already-l2, commit-push-pr-merge]
+    trigger_rule: all_done
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/status.txt" ]; then
+        STATUS=$(cat "$ARTIFACTS_DIR/status.txt" | tr -d '[:space:]')
+      else
+        STATUS="READINESS_UNKNOWN"
+      fi
+      echo "<<<STATUS:$STATUS>>>"
+    timeout: 5000
