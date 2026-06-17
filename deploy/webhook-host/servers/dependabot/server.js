@@ -119,11 +119,14 @@ const HANDLED_ACTIONS = new Set(['opened', 'reopened']);
 // is unaffected. Unset/remove this for normal operation.
 const ALLOW_SELF_REOPEN = process.env.WEBHOOK_ALLOW_SELF_REOPEN === '1';
 
-// Backlog discovery. On boot (and after every run completes), list open
-// Dependabot PRs per repo and enqueue any not yet handled — so PRs that opened
-// while the server was down, or while another PR was running, get picked up.
-// Default ON; set WEBHOOK_DISCOVER_ON_BOOT=0 to disable the boot scan.
-const DISCOVER_ON_BOOT = process.env.WEBHOOK_DISCOVER_ON_BOOT !== '0';
+// Backlog discovery. When ENABLED, the server proactively scans `gh pr list`
+// for open Dependabot PRs — on boot AND after every run completes — and
+// enqueues any not yet handled, draining the whole backlog. When DISABLED, the
+// server is purely event-driven: only PRs delivered by webhook are queued and
+// run (one repo at a time). Webhook-delivered PRs are ALWAYS handled regardless
+// of this flag — disabling it only stops the proactive all-PR scans.
+// Set WEBHOOK_DISCOVERY=0 to disable (default ON).
+const DISCOVERY_ENABLED = process.env.WEBHOOK_DISCOVERY !== '0';
 
 // Durable dedup marker. After a run, if the PR is still OPEN (escalated to
 // human review / not auto-merged / failed), the server adds this label so
@@ -226,7 +229,13 @@ function drain(repo) {
     console.log(`[${repo}] PR #${pr} run exited (code ${code}); queue depth ${s.pending.length}`);
     labelIfStillOpen(repo, pr);
     s.running = false;
-    rediscover(repo, s.dir).finally(() => drain(repo));
+    // Only re-scan the full backlog when discovery is enabled. Otherwise stay
+    // event-driven: just drain whatever the webhook has already queued.
+    if (DISCOVERY_ENABLED) {
+      rediscover(repo, s.dir).finally(() => drain(repo));
+    } else {
+      drain(repo);
+    }
   });
 }
 
@@ -477,14 +486,14 @@ server.listen(PORT, BIND_HOST, () => {
   }
   console.log(`  processed label:   ${PROCESSED_LABEL}`);
   console.log(
-    `  boot discovery:    ${DISCOVER_ON_BOOT ? 'ON (enqueue existing open Dependabot PRs)' : 'off (WEBHOOK_DISCOVER_ON_BOOT=0)'}`
+    `  discovery:         ${DISCOVERY_ENABLED ? 'ON (proactively scans + drains the backlog on boot and after each run)' : 'off (event-driven only; WEBHOOK_DISCOVERY=0)'}`
   );
   console.log(`  health endpoint:   http://${BIND_HOST}:${PORT}/health`);
 
   // Backlog discovery on boot: per repo, enqueue every open Dependabot PR that
   // isn't already labeled. The per-repo serial queue then drains them one at a
   // time (concurrent across repos), so existing PRs are caught up gradually.
-  if (DISCOVER_ON_BOOT) {
+  if (DISCOVERY_ENABLED) {
     for (const repo of TARGET_REPOS) {
       const resolved = workdirForRepo(repo);
       if (resolved.error) {

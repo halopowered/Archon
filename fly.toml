@@ -23,11 +23,13 @@ primary_region = 'ord'
   # its own checkout by repository.full_name. Space/comma-separated owner/repo.
   # Add a repo here + redeploy to extend coverage.
   WEBHOOK_TARGET_REPOS = 'halopowered/stack-artifacts'
-  # Backlog drain on boot. OFF for now: new PRs are still handled via webhook,
-  # but the existing open-PR backlog is NOT auto-drained. Set to '1' (or remove)
-  # + redeploy to enqueue every open Dependabot PR (minus those already labeled
-  # 'archon-reviewed') and drain them one at a time per repo.
-  WEBHOOK_DISCOVER_ON_BOOT = '0'
+  # Backlog discovery. OFF for now: the server is purely event-driven — only
+  # PRs delivered by the GitHub webhook are queued and run. The existing open-PR
+  # backlog is NOT scanned or drained (neither on boot nor after each run).
+  # Set to '1' (or remove) + redeploy to proactively scan `gh pr list` and drain
+  # every open Dependabot PR (minus those already labeled 'archon-reviewed'),
+  # one at a time per repo, on boot and after each run completes.
+  WEBHOOK_DISCOVERY = '0'
 
 [http_service]
   internal_port = 3000
@@ -53,6 +55,8 @@ primary_region = 'ord'
     handlers = ['tls', 'http']
 
 [[vm]]
-  memory = '1gb'
-  cpus = 1
-  memory_mb = 1024
+  # Doubled from 1gb/1cpu: the machine also runs the webhook-host and spawns
+  # Dependabot pipeline runs (npm install/build/test in worktrees), which is
+  # memory-hungry. shared-cpu-2x.
+  memory = '2gb'
+  cpus = 2
