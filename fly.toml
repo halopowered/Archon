@@ -47,6 +47,9 @@ primary_region = 'ord'
   GIT_AUTHOR_EMAIL = 'archon-bot@users.noreply.github.com'
   GIT_COMMITTER_NAME = 'Archon Bot'
   GIT_COMMITTER_EMAIL = 'archon-bot@users.noreply.github.com'
+  # Let corepack download the project-pinned pnpm/yarn non-interactively
+  # (auto-fix-conflict regenerates pnpm/yarn lockfiles via corepack).
+  COREPACK_ENABLE_DOWNLOAD_PROMPT = '0'
   # Speed up the many `npm ci`/`npm install` runs the Dependabot pipeline does
   # in worktrees. npm reads npm_config_* env vars: skip the post-install audit
   # (a network round-trip + full-tree scan) and funding output, and prefer the

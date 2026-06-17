@@ -94,7 +94,23 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
 # NOTE: nodejs/npm are intentionally KEPT (not purged) — the webhook-host
 # dependabot workflows (verify-and-merge, auto-fix-install) run `npm ci`,
 # `npm install`, `npm run build`, and `npm test` on target-repo PR branches.
-RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
+# Node.js 22 (LTS) via the official binary tarball, not Debian's Node 20: modern
+# pnpm (v11, selected by corepack) requires `node:sqlite`, which only exists in
+# Node 22+ (Node 20 fails with ERR_UNKNOWN_BUILTIN_MODULE). The lockfile-conflict
+# auto-fix regenerates pnpm/yarn lockfiles, so it needs a working pnpm.
+# Tarball (.tar.gz) install is deterministic — no apt repo / gpg dependency.
+# Resolve the LATEST Node 22.x at build time (pnpm 11 needs >= 22.13, so a
+# fixed older patch like 22.12 fails); index.json is newest-first. jq + curl
+# are already installed above. corepack@latest then honors each project's
+# `packageManager` pin.
+RUN ARCH="$(dpkg --print-architecture)" \
+    && case "$ARCH" in amd64) NODEARCH=x64 ;; arm64) NODEARCH=arm64 ;; *) echo "unsupported arch $ARCH" >&2; exit 1 ;; esac \
+    && NODE_VERSION="$(curl -fsSL https://nodejs.org/dist/index.json | jq -r '[.[] | select(.version | startswith("v22."))][0].version')" \
+    && echo "Installing Node ${NODE_VERSION} (${NODEARCH})" \
+    && curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-${NODEARCH}.tar.gz" \
+       | tar -xz -C /usr/local --strip-components=1 --no-same-owner \
+    && node --version && npm --version \
+    && npm install -g corepack@latest \
     && npm install -g agent-browser@0.22.1 \
     && NATIVE_BIN=$(find /usr/local/lib/node_modules/agent-browser -name 'agent-browser-*' -type f -executable 2>/dev/null | head -1) \
     && if [ -n "$NATIVE_BIN" ]; then \
