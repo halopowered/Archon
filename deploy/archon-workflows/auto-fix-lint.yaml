@@ -1,0 +1,361 @@
+name: auto-fix-lint
+description: |
+  Use when: verify-and-merge reported `failure_reason: lint` on a Dependabot
+  PR and you want to fix the lint errors and merge.
+
+  Triggers (run): "auto-fix lint", "fix lint pr".
+
+  Input (from $ARGUMENTS): a single Dependabot PR number, e.g. "57".
+
+  Does:
+  - Validates the PR is a Dependabot PR
+  - Identifies the project folder
+  - Checks out the PR's head branch in the Archon worktree
+  - Fixes the lint errors: `eslint --fix` for mechanical issues, then targeted
+    source edits (e.g. remove unused vars) for the rest — LINT-ONLY changes,
+    no behavior changes
+  - Re-verifies the tree: lint must be clean AND build + test must pass
+  - On success: opens a replacement PR (dep bump + lint fixes), auto-approves
+    and squash-merges it, comments on the original Dependabot PR
+  - On no-fix-available: comments on the original PR with the diagnostic
+    and stops (no PR opened)
+
+  NOT for: install failures (use auto-fix-install), build/test failures,
+           non-Dependabot PRs, non-Node stacks.
+
+nodes:
+  # ── Step 1: Fetch + validate the PR ───────────────────────────────────
+  # Output: <PR JSON> | INVALID_INPUT | PR_NOT_FOUND | NOT_A_DEPENDABOT_PR
+  - id: fetch-pr
+    bash: |
+      #!/bin/bash
+      set -u
+      ARG=$(echo "$ARGUMENTS" | awk '{$1=$1};1')
+      PR_NUMBER=$(echo "$ARG" | grep -oE '[0-9]+' | head -1)
+      if [ -z "$PR_NUMBER" ]; then
+        echo "Provide a PR number, e.g. \"57\" or \"#57\"." \
+          > "$ARTIFACTS_DIR/error.txt"
+        echo "INVALID_INPUT"; exit 0
+      fi
+
+      PR_FIELDS='number,title,author,headRefName,baseRefName,mergeable'
+      if ! pr=$(gh pr view "$PR_NUMBER" --json "$PR_FIELDS" 2>/dev/null); then
+        echo "Could not fetch PR #$PR_NUMBER (does it exist on this repo?)" \
+          > "$ARTIFACTS_DIR/error.txt"
+        echo "PR_NOT_FOUND"; exit 0
+      fi
+
+      author=$(echo "$pr" | jq -r '.author.login')
+      case "$author" in
+        'dependabot[bot]'|app/dependabot|dependabot)
+          echo "$pr" > "$ARTIFACTS_DIR/pr.json"
+          echo "$pr"
+          ;;
+        *)
+          echo "PR #$PR_NUMBER is authored by '$author', not Dependabot." \
+            > "$ARTIFACTS_DIR/error.txt"
+          echo "NOT_A_DEPENDABOT_PR"
+          ;;
+      esac
+    timeout: 15000
+
+  # ── Step 2: Single gate that routes on validation result ──────────────
+  - id: gate-fetch
+    depends_on: [fetch-pr]
+    bash: |
+      OUTPUT=$fetch-pr.output
+      case "$OUTPUT" in
+        INVALID_INPUT|PR_NOT_FOUND|NOT_A_DEPENDABOT_PR|"")
+          echo "ERROR"
+          ;;
+        *)
+          echo "PROCEED"
+          ;;
+      esac
+    timeout: 5000
+
+  - id: report-fetch-error
+    depends_on: [fetch-pr, gate-fetch]
+    when: "$gate-fetch.output == 'ERROR'"
+    bash: |
+      OUTPUT=$fetch-pr.output
+      case "$OUTPUT" in
+        INVALID_INPUT)        STATUS="AUTOFIX_LINT_INVALID_INPUT" ;;
+        PR_NOT_FOUND)         STATUS="AUTOFIX_LINT_PR_NOT_FOUND" ;;
+        NOT_A_DEPENDABOT_PR)  STATUS="AUTOFIX_LINT_NOT_DEPENDABOT" ;;
+        *)                    STATUS="AUTOFIX_LINT_UNKNOWN_ERROR" ;;
+      esac
+      echo "$STATUS" > "$ARTIFACTS_DIR/status.txt"
+
+      echo "❌ auto-fix-lint:"
+      cat "$ARTIFACTS_DIR/error.txt"
+    timeout: 5000
+
+  # ── Step 3: Identify the project folder ───────────────────────────────
+  - id: identify-folder
+    depends_on: [fetch-pr, gate-fetch]
+    when: "$gate-fetch.output == 'PROCEED'"
+    bash: |
+      #!/bin/bash
+      set -eu
+      PR_NUMBER=$(jq -r '.number' "$ARTIFACTS_DIR/pr.json")
+      files=$(gh pr diff "$PR_NUMBER" --name-only 2>/dev/null || true)
+      if [ -z "$files" ]; then
+        echo "."
+        exit 0
+      fi
+      echo "$files" | awk -F/ '
+        NR == 1 {
+          common_n = NF - 1
+          for (i = 1; i <= common_n; i++) prefix[i] = $i
+          next
+        }
+        {
+          max_check = (NF - 1 < common_n ? NF - 1 : common_n)
+          new_common = 0
+          for (i = 1; i <= max_check; i++) {
+            if (prefix[i] != $i) break
+            new_common = i
+          }
+          common_n = new_common
+        }
+        END {
+          if (common_n == 0) { print "."; exit }
+          out = prefix[1]
+          for (i = 2; i <= common_n; i++) out = out "/" prefix[i]
+          print out
+        }
+      '
+    timeout: 30000
+
+  # ── Step 4: Checkout the PR's head branch ─────────────────────────────
+  - id: checkout-pr-branch
+    depends_on: [fetch-pr, gate-fetch]
+    when: "$gate-fetch.output == 'PROCEED'"
+    bash: |
+      set -e
+      PR_NUMBER=$(jq -r '.number' "$ARTIFACTS_DIR/pr.json")
+
+      # Detached HEAD avoids "refusing to fetch into branch checked out at
+      # <other worktree>" and keeps git's tracking output off this node's stdout.
+      git fetch origin "pull/$PR_NUMBER/head" >/dev/null 2>&1
+      git checkout FETCH_HEAD >/dev/null 2>&1
+
+      echo "detached-at-pr-$PR_NUMBER"
+    timeout: 60000
+
+  # ── Step 5: Fix the lint errors, then re-verify ───────────────────────
+  # Strategy: mechanical `eslint --fix` first, then targeted LINT-ONLY source
+  # edits for the rest, then confirm lint is clean AND build + test still pass.
+  #
+  # Outputs (one of):
+  #   FIXED               — lint clean + build + test pass, files changed
+  #   NO_FIX_AVAILABLE    — couldn't reach a clean lint state without a
+  #                         behavior change, or build/test failed after fixing
+  - id: attempt-lint-fix
+    depends_on: [identify-folder, checkout-pr-branch]
+    prompt: |
+      You are fixing the lint errors on a Dependabot PR so it can be merged.
+
+      Project folder:  $identify-folder.output
+      Local branch:    $checkout-pr-branch.output (already checked out, detached HEAD)
+      Artifacts dir:   $ARTIFACTS_DIR
+
+      Procedure:
+      1. `cd` into the project folder. Confirm it is a Node project with a lint
+         script (`package.json` → `scripts.lint`). If there is no lint script,
+         this workflow does not apply — write a one-line reason to
+         "$ARTIFACTS_DIR/diagnostic.txt" and output NO_FIX_AVAILABLE.
+      2. Install if needed (`npm ci --legacy-peer-deps`, or `npm install
+         --legacy-peer-deps` if the lockfile is out of sync) so the linter and
+         its plugins are available. Capture to "$ARTIFACTS_DIR/install.log".
+      3. Run the project's lint and capture the errors to
+         "$ARTIFACTS_DIR/lint-before.log".
+      4. Apply mechanical fixes first: `npm run lint -- --fix` (or
+         `npx eslint . --fix` / the project's configured lint command with
+         `--fix`).
+      5. For any errors that remain, edit the source to resolve them — but ONLY
+         lint-driven, behavior-preserving changes (e.g. remove an unused
+         variable/import, prefix an intentionally-unused arg with `_`, add a
+         missing type annotation). DO NOT change runtime behavior, delete
+         logic, or suppress errors with blanket `eslint-disable`. If a clean
+         lint state cannot be reached without a behavior change or a judgment
+         call, STOP and output NO_FIX_AVAILABLE with the reason.
+      6. Re-run lint — it MUST report zero errors. Capture to
+         "$ARTIFACTS_DIR/lint-after.log".
+      7. Re-run build and test to confirm your edits didn't break anything:
+           npm run build --if-present   → "$ARTIFACTS_DIR/build.log"
+           npm test --if-present -- --watch=false --browsers=ChromeHeadless
+                                        → "$ARTIFACTS_DIR/test.log"
+         If build or test now fails, output NO_FIX_AVAILABLE (your fix is not
+         safe). Treat a missing headless browser / network / disk error as an
+         environment issue → NO_FIX_AVAILABLE with that noted.
+      8. List the files you edited in "$ARTIFACTS_DIR/edited-files.txt" (one
+         path per line, relative to the repo root). Leave your working-tree
+         edits in place (uncommitted) — a later node commits them.
+
+      Output structured JSON. `files_edited` is the newline-joined list from
+      step 8 (empty if none). `error_excerpt` is the last 30 lines of the
+      relevant log on failure (empty on success).
+    model: sonnet
+    allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
+    output_format:
+      type: object
+      properties:
+        result:
+          type: string
+          enum: [FIXED, NO_FIX_AVAILABLE]
+        summary:
+          type: string
+        files_edited:
+          type: string
+        error_excerpt:
+          type: string
+      required: [result, summary, files_edited, error_excerpt]
+
+  # ── Step 6a: Open replacement PR + auto-merge ─────────────────────────
+  - id: open-fix-pr-and-merge
+    depends_on: [attempt-lint-fix, fetch-pr, identify-folder]
+    when: "$attempt-lint-fix.output.result == 'FIXED'"
+    bash: |
+      set -e
+      # Provisional — overwritten on success at the end.
+      echo "AUTOFIX_LINT_MERGE_FAILED" > "$ARTIFACTS_DIR/status.txt"
+
+      PR_NUMBER=$(jq -r '.number' "$ARTIFACTS_DIR/pr.json")
+      ORIG_TITLE=$(jq -r '.title' "$ARTIFACTS_DIR/pr.json")
+      FIX_BRANCH="fix/lint-pr-$PR_NUMBER"
+
+      # Branch off current HEAD (Dependabot's tip + the uncommitted lint edits).
+      git checkout -B "$FIX_BRANCH"
+      # Stage everything the lint fix touched (source edits + any lockfile from
+      # the install step). Dependabot PRs don't touch source, so the only
+      # source changes here are our lint fixes.
+      git add -A
+
+      if git diff --cached --quiet; then
+        echo "❌ No staged changes — nothing to fix (this should not happen if attempt-lint-fix returned FIXED)."
+        exit 1
+      fi
+
+      git commit -m "fix: resolve lint errors to unblock Dependabot PR #$PR_NUMBER"
+      git push -u origin "$FIX_BRANCH" >/dev/null 2>&1
+
+      SUMMARY=$attempt-lint-fix.output.summary
+      FILES=$attempt-lint-fix.output.files_edited
+
+      PR_BODY_FILE="$ARTIFACTS_DIR/replacement-pr-body.md"
+      {
+        echo "## Summary"
+        echo ""
+        echo "Replaces Dependabot PR #$PR_NUMBER. Same dependency bump, plus"
+        echo "lint fixes so local verification passes."
+        echo ""
+        echo "## Auto-fix-lint details"
+        echo ""
+        echo "$SUMMARY"
+        echo ""
+        if [ -n "$FILES" ]; then
+          echo "Files edited (lint-only, behavior-preserving):"
+          echo ""
+          echo '```'
+          echo "$FILES"
+          echo '```'
+          echo ""
+        fi
+        echo "Verified locally in the Archon worktree: lint clean, build ✅, test ✅."
+        echo ""
+        echo "Auto-generated by the \`auto-fix-lint\` Archon workflow."
+      } > "$PR_BODY_FILE"
+
+      OWNER_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+
+      NEW_PR_JSON=$(gh api -X POST "repos/$OWNER_REPO/pulls" \
+        -f title="$ORIG_TITLE" \
+        -F body=@"$PR_BODY_FILE" \
+        -f head="$FIX_BRANCH" \
+        -f base=main)
+      NEW_PR_NUMBER=$(echo "$NEW_PR_JSON" | jq -r '.number')
+      new_pr_url=$(echo "$NEW_PR_JSON" | jq -r '.html_url')
+      echo "📬 Opened replacement PR: $new_pr_url (#$NEW_PR_NUMBER)"
+
+      gh api -X POST "repos/$OWNER_REPO/pulls/$NEW_PR_NUMBER/reviews" \
+        -f event=APPROVE \
+        -f body="Lint fix verified locally (lint clean + build + test all green)." \
+        >/dev/null 2>&1 || echo "  (approve failed; continuing to merge)"
+
+      gh api -X PUT "repos/$OWNER_REPO/pulls/$NEW_PR_NUMBER/merge" \
+        -f merge_method=squash >/dev/null
+
+      gh api -X DELETE "repos/$OWNER_REPO/git/refs/heads/$FIX_BRANCH" 2>/dev/null || true
+
+      echo "AUTOFIX_LINT_MERGED" > "$ARTIFACTS_DIR/status.txt"
+
+      ORIG_COMMENT="🧹 **Lint auto-fix applied.**
+
+      Replacement PR: $new_pr_url (auto-approved and squash-merged).
+
+      Dependabot will close this PR automatically once the dependency is at the requested version on \`main\`. If it doesn't, this PR can be closed manually."
+
+      gh api -X POST "repos/$OWNER_REPO/issues/$PR_NUMBER/comments" \
+        -f body="$ORIG_COMMENT" >/dev/null
+
+      echo "✅ Replacement PR merged: $new_pr_url"
+    timeout: 180000
+
+  # ── Step 6b: No fix available — comment with diagnostic ───────────────
+  - id: comment-no-fix-available
+    depends_on: [attempt-lint-fix, fetch-pr]
+    when: "$attempt-lint-fix.output.result == 'NO_FIX_AVAILABLE'"
+    bash: |
+      set -e
+      echo "AUTOFIX_LINT_NO_FIX_AVAILABLE" > "$ARTIFACTS_DIR/status.txt"
+      PR_NUMBER=$(jq -r '.number' "$ARTIFACTS_DIR/pr.json")
+      SUMMARY=$attempt-lint-fix.output.summary
+      EXCERPT=$attempt-lint-fix.output.error_excerpt
+
+      BODY_FILE="$ARTIFACTS_DIR/no-fix-comment.md"
+      {
+        echo "🔧 **Lint auto-fix attempted; no safe fix applies.**"
+        echo ""
+        echo "$SUMMARY"
+        echo ""
+        if [ -n "$EXCERPT" ]; then
+          echo "<details><summary>Error excerpt</summary>"
+          echo ""
+          echo '```'
+          echo "$EXCERPT"
+          echo '```'
+          echo ""
+          echo "</details>"
+          echo ""
+        fi
+        echo "Resolving requires a human (the remaining lint errors need a"
+        echo "judgment call or a behavior change beyond the scope of automatic"
+        echo "lint fixes)."
+        echo ""
+        echo "_Posted by the \`auto-fix-lint\` Archon workflow._"
+      } > "$BODY_FILE"
+
+      OWNER_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+      gh api -X POST "repos/$OWNER_REPO/issues/$PR_NUMBER/comments" \
+        -F body=@"$BODY_FILE" >/dev/null
+
+      echo "💬 PR #$PR_NUMBER: posted no-fix-available comment"
+    timeout: 30000
+
+  # ── Final: emit the orchestrator-readable status marker ──────────────
+  - id: report-status
+    depends_on:
+      - report-fetch-error
+      - open-fix-pr-and-merge
+      - comment-no-fix-available
+    trigger_rule: all_done
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/status.txt" ]; then
+        STATUS=$(cat "$ARTIFACTS_DIR/status.txt" | tr -d '[:space:]')
+      else
+        STATUS="AUTOFIX_LINT_UNKNOWN"
+      fi
+      echo "<<<STATUS:$STATUS>>>"
+    timeout: 5000

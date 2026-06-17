@@ -358,14 +358,23 @@ nodes:
 
         autofix_status="not-attempted"
 
-        # ── Step 3b: Tier-1 install autofix ─────────────────────────
-        if [ "$verify_status" = "VERIFY_FAILED_INSTALL" ]; then
-          echo "🛠️  Install failure — attempting Tier-1 auto-fix for PR #$num"
-          run_sub auto-fix-install \
-            "run/$RUN_TAG-autofix-pr-$num" \
-            "$num"
-          autofix_status=$(cat "$ARTIFACTS_DIR/.last-sentinel")
-        fi
+        # ── Step 3b: targeted auto-fix by failure type ──────────────
+        case "$verify_status" in
+          VERIFY_FAILED_INSTALL)
+            echo "🛠️  Install failure — attempting Tier-1 install auto-fix for PR #$num"
+            run_sub auto-fix-install \
+              "run/$RUN_TAG-autofix-pr-$num" \
+              "$num"
+            autofix_status=$(cat "$ARTIFACTS_DIR/.last-sentinel")
+            ;;
+          VERIFY_FAILED_LINT)
+            echo "🧹 Lint failure — attempting lint auto-fix for PR #$num"
+            run_sub auto-fix-lint \
+              "run/$RUN_TAG-lintfix-pr-$num" \
+              "$num"
+            autofix_status=$(cat "$ARTIFACTS_DIR/.last-sentinel")
+            ;;
+        esac
 
         echo "PR #$num: readiness=$readiness_status, verify=$verify_status, autofix=$autofix_status" \
           >> "$RESULTS_FILE"

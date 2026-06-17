@@ -228,8 +228,22 @@ nodes:
            $ARTIFACTS_DIR/test.log
          Use `command 2>&1 | tee "$ARTIFACTS_DIR/<step>.log"`.
       5. Stop on the first failure — don't run later steps after a failure.
-         A lint failure is a real failure (failure_reason="lint") — this gate
-         auto-merges major bumps, so lint/build/test must all be green.
+         A lint failure is a real failure (failure_reason="lint").
+
+      6. BASELINE CHECK (only when failure_reason is "build" or "test"):
+         determine whether the failure is PRE-EXISTING on the base branch — i.e.
+         the bump didn't cause it. Read the base branch name from
+         `$ARTIFACTS_DIR/pr.json` (`.baseRefName`), then:
+           git fetch origin <baseRef>
+           git checkout FETCH_HEAD        # detached at base; safe — nothing
+                                          # after verify uses the local head
+         `cd` into the SAME project folder, run the SAME command that failed
+         (install first if the folder needs it), and capture to
+         "$ARTIFACTS_DIR/baseline.log". If that step ALSO fails on the base
+         branch, set preexisting="yes" (the PR is not responsible). If it
+         PASSES on base, the PR introduced the regression → preexisting="no".
+         For success, lint, install, environment, or no_stack_detected
+         outcomes, set preexisting="no".
 
       Environment caveats (treat as environment failures, NOT project bugs):
       - Browser missing for headless tests (Chrome / Chromium not installed)
@@ -256,13 +270,16 @@ nodes:
         failure_reason:
           type: string
           enum: ["", "install", "lint", "build", "test", "no_stack_detected", "environment"]
+        preexisting:
+          type: string
+          enum: ["yes", "no"]
         summary:
           type: string
         error_excerpt:
           type: string
         command_log:
           type: string
-      required: [success, detected_stack, failure_reason, summary, error_excerpt, command_log]
+      required: [success, detected_stack, failure_reason, preexisting, summary, error_excerpt, command_log]
 
   # ── Step 7: Gate that combines verify result + bump type → action ─────
   # Output: "MERGE" | "MAJOR_REVIEW" | "FAIL_COMMENT" | "ABORT"
@@ -271,9 +288,22 @@ nodes:
     bash: |
       #!/bin/bash
       SUCCESS=$verify-build-test.output.success
+      REASON=$verify-build-test.output.failure_reason
+      PREEXISTING=$verify-build-test.output.preexisting
       BUMP=$extract-bump-type.output
 
-      if [ "$SUCCESS" = "no" ]; then
+      # A build/test failure that ALSO fails on the base branch is pre-existing:
+      # the bump didn't cause it, so it must not block the merge. (Lint failures
+      # are handled separately by the auto-fix-lint path; install/env/no_stack
+      # stay hard failures.)
+      EFFECTIVE_SUCCESS="$SUCCESS"
+      if [ "$SUCCESS" = "no" ] && [ "$PREEXISTING" = "yes" ] \
+         && { [ "$REASON" = "build" ] || [ "$REASON" = "test" ]; }; then
+        echo "ℹ️  $REASON failure is pre-existing on the base branch — not blocking the bump." >&2
+        EFFECTIVE_SUCCESS="yes"
+      fi
+
+      if [ "$EFFECTIVE_SUCCESS" = "no" ]; then
         echo "FAIL_COMMENT"
       elif [ "$BUMP" = "patch" ] || [ "$BUMP" = "minor" ] || [ "$BUMP" = "major" ]; then
         # Policy: auto-merge any bump — including major — once local
