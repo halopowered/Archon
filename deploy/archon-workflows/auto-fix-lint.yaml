@@ -162,31 +162,36 @@ nodes:
       Artifacts dir:   $ARTIFACTS_DIR
 
       Procedure:
-      1. `cd` into the project folder. Confirm it is a Node project with a lint
-         script (`package.json` → `scripts.lint`). If there is no lint script,
-         this workflow does not apply — write a one-line reason to
-         "$ARTIFACTS_DIR/diagnostic.txt" and output NO_FIX_AVAILABLE.
-      2. Install if needed (`npm ci --legacy-peer-deps`, or `npm install
-         --legacy-peer-deps` if the lockfile is out of sync) so the linter and
-         its plugins are available. Capture to "$ARTIFACTS_DIR/install.log".
-      3. Run the project's lint and capture the errors to
+      1. `cd` into the project folder. Identify the stack + linter:
+         - Node: `package.json` with a `scripts.lint` (eslint).
+         - Python: `pyproject.toml` with ruff configured (`[tool.ruff]`) and/or
+           ruff in the Poetry dev deps.
+         If there's no configured linter, this workflow does not apply — write a
+         one-line reason to "$ARTIFACTS_DIR/diagnostic.txt" and output
+         NO_FIX_AVAILABLE.
+      2. Install so the linter + plugins are available; capture to
+         "$ARTIFACTS_DIR/install.log":
+         - Node:   `npm ci --legacy-peer-deps` (or `npm install --legacy-peer-deps`).
+         - Python: `poetry install`.
+      3. Run the project's lint and capture errors to
          "$ARTIFACTS_DIR/lint-before.log".
-      4. Apply mechanical fixes first: `npm run lint -- --fix` (or
-         `npx eslint . --fix` / the project's configured lint command with
-         `--fix`).
+      4. Apply mechanical fixes first:
+         - Node:   `npm run lint -- --fix` (or `npx eslint . --fix`).
+         - Python: `poetry run ruff check . --fix` (add `--unsafe-fixes` ONLY if
+           the remaining fixes are clearly behavior-preserving).
       5. For any errors that remain, edit the source to resolve them — but ONLY
          lint-driven, behavior-preserving changes (e.g. remove an unused
          variable/import, prefix an intentionally-unused arg with `_`, add a
          missing type annotation). DO NOT change runtime behavior, delete
-         logic, or suppress errors with blanket `eslint-disable`. If a clean
+         logic, or blanket-suppress (`eslint-disable` / `# noqa`). If a clean
          lint state cannot be reached without a behavior change or a judgment
          call, STOP and output NO_FIX_AVAILABLE with the reason.
       6. Re-run lint — it MUST report zero errors. Capture to
          "$ARTIFACTS_DIR/lint-after.log".
       7. Re-run build and test to confirm your edits didn't break anything:
-           npm run build --if-present   → "$ARTIFACTS_DIR/build.log"
-           npm test --if-present -- --watch=false --browsers=ChromeHeadless
-                                        → "$ARTIFACTS_DIR/test.log"
+           Node:   `npm run build --if-present` → build.log;
+                   `npm test --if-present -- --watch=false --browsers=ChromeHeadless` → test.log
+           Python: `poetry run pytest` → test.log (no separate build step)
          If build or test now fails, output NO_FIX_AVAILABLE (your fix is not
          safe). Treat a missing headless browser / network / disk error as an
          environment issue → NO_FIX_AVAILABLE with that noted.

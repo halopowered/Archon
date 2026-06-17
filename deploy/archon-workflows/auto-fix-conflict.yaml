@@ -154,7 +154,7 @@ nodes:
 
       log_diag() { echo "$1" >> "$ARTIFACTS_DIR/diagnostic.txt"; }
 
-      LOCKFILES='package-lock.json pnpm-lock.yaml yarn.lock npm-shrinkwrap.json bun.lockb'
+      LOCKFILES='package-lock.json pnpm-lock.yaml yarn.lock npm-shrinkwrap.json bun.lockb poetry.lock uv.lock Pipfile.lock'
 
       # Detect the package manager from the lockfile present in the folder.
       detect_pm() {
@@ -162,6 +162,7 @@ nodes:
         if [ -f "$FOLDER/yarn.lock" ]; then echo "corepack yarn"; return; fi
         if [ -f "$FOLDER/bun.lockb" ]; then echo "bun"; return; fi
         if [ -f "$FOLDER/package-lock.json" ] || [ -f "$FOLDER/npm-shrinkwrap.json" ]; then echo "npm"; return; fi
+        if [ -f "$FOLDER/poetry.lock" ]; then echo "poetry"; return; fi
         echo ""
       }
       PM=$(detect_pm)
@@ -203,9 +204,9 @@ nodes:
         [ -n "$lf" ] && git checkout --theirs -- "$lf" 2>/dev/null && git add "$lf"
       done
 
-      if [ ! -f "$FOLDER/package.json" ]; then
+      if [ ! -f "$FOLDER/package.json" ] && [ ! -f "$FOLDER/pyproject.toml" ]; then
         git merge --abort 2>/dev/null || true
-        log_diag "No package.json in '$FOLDER'."
+        log_diag "No package.json or pyproject.toml in '$FOLDER'."
         echo "NO_FIX_AVAILABLE"; exit 0
       fi
 
@@ -221,6 +222,7 @@ nodes:
         "corepack pnpm")  regen=(corepack pnpm install --lockfile-only) ;;
         "corepack yarn")  regen=(corepack yarn install --mode update-lockfile) ;;
         bun)              regen=(bun install --lockfile-only) ;;
+        poetry)           regen=(poetry lock) ;;
         *)                regen=($PM install) ;;
       esac
       echo "+ regen: ${regen[*]}" > "$ARTIFACTS_DIR/install.log"

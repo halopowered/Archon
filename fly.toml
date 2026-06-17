@@ -61,6 +61,11 @@ primary_region = 'ord'
   # downloaded tarballs across deploys/restarts instead of re-downloading the
   # full tree each time. Entrypoint creates + chowns /cache/npm for appuser.
   npm_config_cache = '/cache/npm'
+  # Poetry (Python pipeline): non-interactive, in-project venvs (clean per
+  # worktree), and cache on the persistent volume (like the npm cache).
+  POETRY_NO_INTERACTION = '1'
+  POETRY_VIRTUALENVS_IN_PROJECT = '1'
+  POETRY_CACHE_DIR = '/cache/poetry'
 
 # Persistent cache volume (npm tarball cache). Single volume for the single
 # always-on machine. Create once: `fly volumes create npm_cache --region ord --size 3`.

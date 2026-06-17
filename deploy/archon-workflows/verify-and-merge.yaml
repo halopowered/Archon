@@ -218,9 +218,16 @@ nodes:
            npm run lint --if-present
            npm run build --if-present
            npm test --if-present -- --watch=false --browsers=ChromeHeadless
-         For other stacks, run the configured linter too (e.g. `ruff check`,
-         `golangci-lint run`, `cargo clippy`). Skip lint ONLY when the project
-         has no linter configured — never skip it just because it fails.
+         For Python with Poetry (pyproject.toml + poetry.lock), prefer:
+           poetry install                          (install = the dep step)
+           poetry run ruff check .                 (lint, if ruff is configured)
+           poetry run pytest                       (test; no separate build step)
+         `poetry` is on PATH; venvs are in-project. If `poetry install` reports
+         the lockfile is out of date, run `poetry lock` then `poetry install`
+         and treat the original as failure_reason="install".
+         For other stacks, run the configured linter too (e.g. `golangci-lint
+         run`, `cargo clippy`). Skip lint ONLY when the project has no linter
+         configured — never skip it just because it fails.
       4. Capture stdout+stderr from each step into separate logs:
            $ARTIFACTS_DIR/install.log
            $ARTIFACTS_DIR/lint.log

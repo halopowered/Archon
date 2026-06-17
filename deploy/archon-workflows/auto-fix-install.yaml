@@ -167,10 +167,34 @@ nodes:
 
       log_diag() { echo "$1" >> "$ARTIFACTS_DIR/diagnostic.txt"; }
 
-      # Validate the project folder has a Node manifest. Tier-1 is
-      # Node/npm-only.
+      # ── Python (Poetry) Tier-1: regenerate poetry.lock, verify install+test ──
+      if [ -f "$FOLDER/pyproject.toml" ] && [ -f "$FOLDER/poetry.lock" ] && [ ! -f "$FOLDER/package.json" ]; then
+        cd "$FOLDER" || { log_diag "Could not cd into $FOLDER"; echo "NO_FIX_AVAILABLE"; exit 0; }
+        cp poetry.lock "$ARTIFACTS_DIR/lockfile.original"
+        if ! poetry lock > "$ARTIFACTS_DIR/install.log" 2>&1; then
+          log_diag "poetry lock failed. See install.log."; echo "NO_FIX_AVAILABLE"; exit 0
+        fi
+        if cmp -s poetry.lock "$ARTIFACTS_DIR/lockfile.original"; then
+          log_diag "poetry.lock unchanged after re-lock — original failure was transient/environmental."
+          echo "NO_FIX_AVAILABLE"; exit 0
+        fi
+        if ! poetry install >> "$ARTIFACTS_DIR/install.log" 2>&1; then
+          log_diag "poetry install failed after re-lock. See install.log."; echo "NO_FIX_AVAILABLE"; exit 0
+        fi
+        if ! poetry run pytest > "$ARTIFACTS_DIR/test.log" 2>&1; then
+          # No tests / test failure: re-lock fixed install but can't confirm tests.
+          if grep -q "no tests ran" "$ARTIFACTS_DIR/test.log" 2>/dev/null; then :; else
+            log_diag "Re-lock succeeded but tests failed. Tier-1 can't fix test failures. See test.log."
+            echo "NO_FIX_AVAILABLE"; exit 0
+          fi
+        fi
+        echo "FIXED"; exit 0
+      fi
+
+      # Validate the project folder has a Node manifest. Tier-1 (Node) is
+      # Node/npm-only; Python is handled above.
       if [ ! -f "$FOLDER/package.json" ]; then
-        log_diag "Folder $FOLDER has no package.json. Tier-1 supports npm projects only."
+        log_diag "Folder $FOLDER has no package.json or poetry project. Tier-1 supports npm + Poetry."
         echo "NO_FIX_AVAILABLE"; exit 0
       fi
 
@@ -234,7 +258,9 @@ nodes:
 
       # Branch off current HEAD (Dependabot's branch tip + uncommitted lockfile diff).
       git checkout -B "$FIX_BRANCH"
-      git add "$FOLDER/package-lock.json"
+      # Stage the regenerated lockfile (npm: package-lock.json; poetry: poetry.lock).
+      git add "$FOLDER/package-lock.json" "$FOLDER/poetry.lock" 2>/dev/null || true
+      git add -A "$FOLDER"
 
       if git diff --cached --quiet; then
         echo "❌ No staged changes. Aborting replacement PR (this should not happen if attempt-tier-1-fix returned FIXED)."

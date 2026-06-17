@@ -124,6 +124,16 @@ RUN ARCH="$(dpkg --print-architecture)" \
     && rm -rf /usr/local/lib/node_modules/agent-browser \
     && rm -rf /var/lib/apt/lists/*
 
+# Poetry — the Dependabot pipeline verifies/auto-fixes Python (Poetry) projects
+# (verify = poetry install/ruff/pytest; auto-fix-conflict regenerates poetry.lock).
+# python3 (3.13, satisfies the projects' >=3.12) is already in the base image;
+# install Poetry into its own venv under /opt and symlink onto PATH for appuser.
+RUN apt-get update && apt-get install -y --no-install-recommends python3-venv \
+    && curl -sSL https://install.python-poetry.org | POETRY_HOME=/opt/poetry python3 - \
+    && ln -s /opt/poetry/bin/poetry /usr/local/bin/poetry \
+    && poetry --version \
+    && rm -rf /var/lib/apt/lists/*
+
 # Point agent-browser to system Chromium (avoids ~400MB Chrome for Testing download)
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 

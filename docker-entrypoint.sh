@@ -26,9 +26,9 @@ if [ "$(id -u)" = "0" ]; then
   # files it writes are already appuser-owned; a recursive chown of a large
   # cache every boot would be wasteful.
   if [ -d /cache ]; then
-    mkdir -p /cache/npm
-    chown appuser:appuser /cache /cache/npm 2>/dev/null || \
-      echo "[archon] WARN: could not chown /cache (npm cache may fall back to default location)" >&2
+    mkdir -p /cache/npm /cache/poetry
+    chown appuser:appuser /cache /cache/npm /cache/poetry 2>/dev/null || \
+      echo "[archon] WARN: could not chown /cache (npm/poetry cache may fall back to default location)" >&2
   fi
   RUNNER="gosu appuser"
 else
