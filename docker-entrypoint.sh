@@ -21,6 +21,15 @@ if [ "$(id -u)" = "0" ]; then
     echo "ERROR: Failed to fix ownership of /home/appuser — volume may be read-only or mounted with incompatible options" >&2
     exit 1
   fi
+  # Persistent npm cache volume (mounted at /cache; npm_config_cache=/cache/npm).
+  # Non-recursive chown of just the dirs — npm runs as appuser so the cached
+  # files it writes are already appuser-owned; a recursive chown of a large
+  # cache every boot would be wasteful.
+  if [ -d /cache ]; then
+    mkdir -p /cache/npm
+    chown appuser:appuser /cache /cache/npm 2>/dev/null || \
+      echo "[archon] WARN: could not chown /cache (npm cache may fall back to default location)" >&2
+  fi
   RUNNER="gosu appuser"
 else
   # Already running as non-root (e.g., --user flag or Kubernetes)

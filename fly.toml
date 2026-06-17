@@ -30,6 +30,23 @@ primary_region = 'ord'
   # every open Dependabot PR (minus those already labeled 'archon-reviewed'),
   # one at a time per repo, on boot and after each run completes.
   WEBHOOK_DISCOVERY = '0'
+  # Speed up the many `npm ci`/`npm install` runs the Dependabot pipeline does
+  # in worktrees. npm reads npm_config_* env vars: skip the post-install audit
+  # (a network round-trip + full-tree scan) and funding output, and prefer the
+  # local cache (falls back to network on a miss, so safe even when cold).
+  npm_config_audit = 'false'
+  npm_config_fund = 'false'
+  npm_config_prefer_offline = 'true'
+  # Persist npm's cache on the mounted volume (see [mounts]) so `npm ci` reuses
+  # downloaded tarballs across deploys/restarts instead of re-downloading the
+  # full tree each time. Entrypoint creates + chowns /cache/npm for appuser.
+  npm_config_cache = '/cache/npm'
+
+# Persistent cache volume (npm tarball cache). Single volume for the single
+# always-on machine. Create once: `fly volumes create npm_cache --region ord --size 3`.
+[mounts]
+  source = 'npm_cache'
+  destination = '/cache'
 
 [http_service]
   internal_port = 3000
