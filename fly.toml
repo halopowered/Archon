@@ -55,8 +55,8 @@ primary_region = 'ord'
     handlers = ['tls', 'http']
 
 [[vm]]
-  # Doubled from 1gb/1cpu: the machine also runs the webhook-host and spawns
-  # Dependabot pipeline runs (npm install/build/test in worktrees), which is
-  # memory-hungry. shared-cpu-2x.
-  memory = '2gb'
-  cpus = 2
+  # Sized for running the webhook-host + concurrent Dependabot pipeline runs
+  # (npm install/build/test in worktrees), which is memory- and CPU-hungry.
+  # shared-cpu-4x. (Was 1gb/1 → 2gb/2 → 4gb/4.)
+  memory = '4gb'
+  cpus = 4
