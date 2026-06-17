@@ -291,6 +291,22 @@ nodes:
           | tr -d '[:space:]'
       }
 
+      # Archon keeps ONE `source` symlink per codebase, and every isolated run
+      # re-points it at its own worktree. Each sub-workflow below runs in its own
+      # worktree, so a leftover link from a prior (sub-)run makes the next one's
+      # auto-registration fail ("Source symlink ... already points to ...").
+      # Clear it before each sub-run so registration starts clean. (ARCHON_DOCKER
+      # is set on the Fly deploy, where the home is /.archon, not $HOME/.archon.)
+      ARCHON_HOME_DIR=$([ "${ARCHON_DOCKER:-}" = "true" ] && echo /.archon || echo "$HOME/.archon")
+      NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)
+      clear_stale_source() {
+        [ -n "$NWO" ] || return 0
+        local link="$ARCHON_HOME_DIR/workspaces/$NWO/source"
+        if [ -L "$link" ]; then
+          rm -f "$link" && echo "  cleared stale source link: $link"
+        fi
+      }
+
       run_sub() {
         # $1 = workflow name, $2 = branch suffix, $3 = arguments
         local wf="$1"
@@ -299,6 +315,9 @@ nodes:
         echo "──────────────────────────────────────────"
         echo " ▶ archon workflow run $wf  ($args)"
         echo "──────────────────────────────────────────"
+        # Drop any stale per-codebase source symlink so this sub-run's worktree
+        # registration starts clean (see clear_stale_source above).
+        clear_stale_source
         local out
         out=$(archon workflow run "$wf" \
               --branch "$branch" \

@@ -38,6 +38,15 @@ primary_region = 'ord'
   # already filtered by the opened/reopened action allowlist, and the pipeline
   # never reopens PRs itself.
   WEBHOOK_ALLOW_SELF_REOPEN = '1'
+  # Git committer identity for the pipeline's commits (auto-fix-lint /
+  # auto-fix-install branch commits). appuser has no ~/.gitconfig on Fly, so
+  # `git commit` errored "Author identity unknown". git reads these env vars
+  # directly (no config file needed). The replacement PRs are squash-merged via
+  # the API by the PAT owner, so this author is effectively cosmetic.
+  GIT_AUTHOR_NAME = 'Archon Bot'
+  GIT_AUTHOR_EMAIL = 'archon-bot@users.noreply.github.com'
+  GIT_COMMITTER_NAME = 'Archon Bot'
+  GIT_COMMITTER_EMAIL = 'archon-bot@users.noreply.github.com'
   # Speed up the many `npm ci`/`npm install` runs the Dependabot pipeline does
   # in worktrees. npm reads npm_config_* env vars: skip the post-install audit
   # (a network round-trip + full-tree scan) and funding output, and prefer the

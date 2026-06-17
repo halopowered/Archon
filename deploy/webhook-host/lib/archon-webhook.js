@@ -67,6 +67,17 @@ async function ghJson(args, fallback = []) {
   }
 }
 
+// Resolve the Archon home dir the SAME way Archon does (packages/paths
+// getArchonHome): under Docker/Fly it's /.archon, not os.homedir()/.archon.
+// Used to locate the per-codebase `source` symlink for stale-link cleanup.
+function archonHome() {
+  if (process.env.ARCHON_DOCKER === 'true' || process.env.WORKSPACE_PATH === '/workspace') {
+    return '/.archon';
+  }
+  if (process.env.ARCHON_HOME) return process.env.ARCHON_HOME;
+  return path.join(os.homedir(), '.archon');
+}
+
 // Resolve the bot/user login whose token the runs act under, for self-event
 // suppression. Explicit env wins; otherwise `gh api /user`. null if unknown.
 function resolveSelfLogin(envVar = 'WEBHOOK_BOT_LOGIN') {
@@ -168,7 +179,7 @@ function createArchonWebhookServer(task) {
   // blocks registration; drop it when it's a symlink we can safely remove.
   function clearStaleArchonSource(repoFullName) {
     if (!repoFullName || repoFullName === 'unknown') return;
-    const link = path.join(os.homedir(), '.archon', 'workspaces', repoFullName, 'source');
+    const link = path.join(archonHome(), 'workspaces', repoFullName, 'source');
     try {
       if (fs.lstatSync(link).isSymbolicLink()) {
         fs.unlinkSync(link);
