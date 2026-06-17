@@ -30,6 +30,14 @@ primary_region = 'ord'
   # every open Dependabot PR (minus those already labeled 'archon-reviewed'),
   # one at a time per repo, on boot and after each run completes.
   WEBHOOK_DISCOVERY = '0'
+  # The server suppresses webhook events whose sender is the bot login
+  # (auto-resolved via `gh api /user` = the PAT owner) to avoid self-induced
+  # loops. But the operator IS that identity, so a manual PR *reopen* (a handy
+  # way to re-trigger the pipeline) gets suppressed too. Allow self-`reopened`
+  # through. Safe: the real loop source (`synchronize` from update-branch) is
+  # already filtered by the opened/reopened action allowlist, and the pipeline
+  # never reopens PRs itself.
+  WEBHOOK_ALLOW_SELF_REOPEN = '1'
   # Speed up the many `npm ci`/`npm install` runs the Dependabot pipeline does
   # in worktrees. npm reads npm_config_* env vars: skip the post-install audit
   # (a network round-trip + full-tree scan) and funding output, and prefer the
