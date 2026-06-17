@@ -301,9 +301,18 @@ function createArchonWebhookServer(task) {
         return reply(res, 200, { ok: true, event: 'ping' });
       }
 
+      // Accept both webhook content types. With "application/json" the body IS
+      // the JSON; with "application/x-www-form-urlencoded" (GitHub's "form"
+      // option) it's `payload=<url-encoded JSON>`. HMAC is over the raw bytes
+      // either way, so verification above already passed.
+      let bodyStr = raw.toString('utf8');
+      const contentType = req.headers['content-type'] || '';
+      if (contentType.includes('application/x-www-form-urlencoded')) {
+        bodyStr = new URLSearchParams(bodyStr).get('payload') || bodyStr;
+      }
       let payload;
       try {
-        payload = JSON.parse(raw.toString('utf8'));
+        payload = JSON.parse(bodyStr);
       } catch {
         return reply(res, 400, { error: 'invalid_json' });
       }

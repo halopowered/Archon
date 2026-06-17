@@ -22,7 +22,7 @@ primary_region = 'ord'
   # /.archon/checkouts/<repo>; the dependabot server routes each incoming PR to
   # its own checkout by repository.full_name. Space/comma-separated owner/repo.
   # Add a repo here + redeploy to extend coverage.
-  WEBHOOK_TARGET_REPOS = 'halopowered/stack-artifacts'
+  WEBHOOK_TARGET_REPOS = 'halopowered/stack-artifacts halopowered/refarch-smartetl'
   # Backlog discovery. OFF for now: the server is purely event-driven — only
   # PRs delivered by the GitHub webhook are queued and run. The existing open-PR
   # backlog is NOT scanned or drained (neither on boot nor after each run).
