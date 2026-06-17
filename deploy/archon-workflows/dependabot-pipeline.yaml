@@ -369,6 +369,29 @@ nodes:
             ;;
         esac
 
+        # ── Step 2b: lockfile-conflict pre-check ────────────────────
+        # A PR that conflicts with base can't be merged by verify-and-merge.
+        # If it's a (mechanical) lockfile conflict, auto-fix-conflict resolves
+        # it by regenerating the lockfile and merges a replacement PR; then this
+        # PR is done. Non-lockfile conflicts escalate inside auto-fix-conflict.
+        mergeable=$(gh pr view "$num" --json mergeable -q .mergeable 2>/dev/null || echo UNKNOWN)
+        # GitHub computes mergeability async; poll briefly if still UNKNOWN.
+        for _ in 1 2 3 4 5; do
+          [ "$mergeable" != "UNKNOWN" ] && break
+          sleep 3
+          mergeable=$(gh pr view "$num" --json mergeable -q .mergeable 2>/dev/null || echo UNKNOWN)
+        done
+        if [ "$mergeable" = "CONFLICTING" ]; then
+          echo "🔀 PR #$num conflicts with base — attempting lockfile-conflict auto-fix"
+          run_sub auto-fix-conflict \
+            "run/$RUN_TAG-conflictfix-pr-$num" \
+            "$num"
+          conflict_status=$(cat "$ARTIFACTS_DIR/.last-sentinel")
+          echo "PR #$num: readiness=$readiness_status, conflict=$conflict_status" \
+            >> "$RESULTS_FILE"
+          continue
+        fi
+
         # ── Step 3a of pipeline: verify-and-merge ───────────────────
         run_sub verify-and-merge \
           "run/$RUN_TAG-verify-pr-$num" \
