@@ -69,5 +69,20 @@ while :; do
   else
     echo "  PR #$pr is $state"
   fi
+
+  # Reclaim disk after every PR. Each pipeline run leaves worktrees (the
+  # top-level run plus any sub-run the pipeline's own `archon complete` missed),
+  # several carrying node_modules / Poetry venvs. The built-in isolation cleanup
+  # skips them (untracked deps look "dirty"), so on the small Fly rootfs a long
+  # drain fills the disk (ENOSPC). Force-remove every linked worktree of this
+  # checkout (NOT the main checkout itself) then prune the admin records.
+  git worktree list --porcelain 2>/dev/null \
+    | awk '/^worktree /{print $2}' \
+    | grep -F '/worktrees/' \
+    | while read -r wt; do
+        git worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt"
+      done
+  git worktree prune 2>/dev/null || true
+
   processed=$((processed + 1))
 done

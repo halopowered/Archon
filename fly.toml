@@ -6,6 +6,16 @@
 app = 'archon-sandbox'
 primary_region = 'ord'
 
+# Swap buffer so the Dependabot pipeline can't OOM the VM. Each `npm ci` on a
+# large project resides at ~1.8GB; when one sub-run's install winds down as the
+# next spins up, two coexist briefly (~3.6GB) and, with ~0.85GB of baseline
+# (server + claude + bun chain), the transient peak exceeds the 4GB RAM and the
+# OOM killer makes the whole box unreachable. Memory otherwise recovers fully
+# between installs (no leak), so swap only needs to absorb the spike — it spills
+# to disk instead of killing the box. Lets us stay on 4GB rather than vertically
+# scaling. The swapfile lives on the rootfs; worktree cleanup keeps disk free.
+swap_size_mb = 3072
+
 [build]
 
 [env]
@@ -97,8 +107,10 @@ primary_region = 'ord'
     handlers = ['tls', 'http']
 
 [[vm]]
-  # Sized for running the webhook-host + concurrent Dependabot pipeline runs
-  # (npm install/build/test in worktrees), which is memory- and CPU-hungry.
-  # shared-cpu-4x. (Was 1gb/1 → 2gb/2 → 4gb/4.)
+  # Sized for running the webhook-host + Dependabot pipeline runs (npm
+  # install/build/test in worktrees), which is memory- and CPU-hungry.
+  # shared-cpu-4x. (Was 1gb/1 → 2gb/2 → 4gb/4.) Kept at 4gb instead of scaling
+  # up: install spikes are absorbed by swap (swap_size_mb above) + the memory
+  # watchdog, not more RAM.
   memory = '4gb'
   cpus = 4

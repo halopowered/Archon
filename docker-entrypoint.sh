@@ -93,6 +93,18 @@ if [ -z "${CLAUDE_BIN_PATH:-}" ]; then
   unset _CLAUDE_BIN_CANDIDATE
 fi
 
+# --- memory watchdog (background) ------------------------------------------
+# Last-resort guard so a Dependabot-pipeline install spike can never make the
+# VM OOM-unreachable. Swap (fly.toml swap_size_mb) absorbs the normal overlap
+# of two ~1.8GB `npm ci`s; this kills only the drain (never the server/host) if
+# combined RAM+swap headroom still goes critical. Always-on, negligible cost.
+# Invoked via `bash <script>`, so the execute bit isn't required (COPY deploy/
+# preserves git's non-executable mode); gate on -f, not -x.
+if [ -f /app/deploy/webhook-host/memwatch.sh ]; then
+  echo "[archon] memwatch: starting memory watchdog"
+  $RUNNER bash /app/deploy/webhook-host/memwatch.sh &
+fi
+
 # --- webhook-host bootstrap (background) -----------------------------------
 # Run the webhook listener subsystem (deploy/webhook-host) alongside the main
 # Archon server. Gated on GITHUB_WEBHOOK_SECRET so we don't restart-loop a
