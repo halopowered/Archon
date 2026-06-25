@@ -134,6 +134,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3-venv \
     && poetry --version \
     && rm -rf /var/lib/apt/lists/*
 
+# Extra Python runtimes for Poetry's interpreter auto-discovery. The base image
+# only ships python3.13, but projects commonly pin e.g. ">=3.11,<3.13", which
+# 3.13 does NOT satisfy — Poetry then fails every install/lint/test with
+# "unable to find a compatible version". Install uv (fast python-build-standalone
+# interpreters, no compilation) and place 3.11 + 3.12 on PATH as python3.11 /
+# python3.12 so Poetry's "find a compatible version" routine selects one
+# automatically (no workflow changes). Shared + world-readable so appuser can
+# execute them. (Need a project on <3.11? add it to the `uv python install`.)
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN curl -LsSf https://astral.sh/uv/install.sh \
+      | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh \
+    && export PATH="/usr/local/bin:/root/.local/bin:$PATH" \
+    && uv python install 3.11 3.12 \
+    && ln -sf "$(uv python find 3.11)" /usr/local/bin/python3.11 \
+    && ln -sf "$(uv python find 3.12)" /usr/local/bin/python3.12 \
+    && chmod -R a+rX /opt/uv-python \
+    && python3.11 --version && python3.12 --version
+
 # Point agent-browser to system Chromium (avoids ~400MB Chrome for Testing download)
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 
