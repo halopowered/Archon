@@ -76,6 +76,13 @@ swap_size_mb = 3072
   POETRY_NO_INTERACTION = '1'
   POETRY_VIRTUALENVS_IN_PROJECT = '1'
   POETRY_CACHE_DIR = '/cache/poetry'
+  # Cap Angular's build worker count. verify runs `npm run build`; an Angular
+  # webpack build otherwise spawns ~6 node workers (~1GB each) sized off the
+  # 4-CPU count, which exhausted RAM+swap and OOM-killed the box. The Angular
+  # builder honors this; `bun` (the Archon server + CLI) ignores it, so it's
+  # safe to set install-wide. The memory watchdog (memwatch.sh) is the hard
+  # backstop — it now kills runaway `node`/`webpack` too.
+  NG_BUILD_MAX_WORKERS = '2'
 
 # Persistent cache volume (npm tarball cache). Single volume for the single
 # always-on machine. Create once: `fly volumes create npm_cache --region ord --size 3`.
