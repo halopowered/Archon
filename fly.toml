@@ -83,6 +83,16 @@ swap_size_mb = 3072
   # safe to set install-wide. The memory watchdog (memwatch.sh) is the hard
   # backstop — it now kills runaway `node`/`webpack` too.
   NG_BUILD_MAX_WORKERS = '2'
+  # Non-interactive CI behavior for build tooling. refarch-smartetl is an Nx
+  # monorepo whose root `npm run build` is `nx run-many --target=build`; Nx
+  # otherwise starts a background daemon and uses interactive/TTY output, which
+  # made verify's `npm run build` hang for the full 10-min timeout every time.
+  # CI=true forces non-interactive output across most JS tools; NX_DAEMON=false
+  # disables the daemon so the command runs and exits cleanly. `bun` ignores
+  # both. (Scoping the build to the changed project is handled in the
+  # verify-and-merge prompt.)
+  CI = 'true'
+  NX_DAEMON = 'false'
 
 # Persistent cache volume (npm tarball cache). Single volume for the single
 # always-on machine. Create once: `fly volumes create npm_cache --region ord --size 3`.

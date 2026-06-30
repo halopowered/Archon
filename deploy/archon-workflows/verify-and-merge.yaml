@@ -218,6 +218,27 @@ nodes:
            npm run lint --if-present
            npm run build --if-present
            npm test --if-present -- --watch=false --browsers=ChromeHeadless
+
+         MONOREPO SCOPING (important — avoid building the whole repo):
+         If the project folder is a monorepo ROOT whose build fans out to every
+         project (e.g. the build script is `nx run-many ...`, `turbo run build`,
+         `lerna run build`, or `pnpm -r build`), DO NOT run that — it is far too
+         slow and will time out. Instead build only the project the PR actually
+         touches:
+           - Nx:    `npx nx build <project>` for the app/lib under the changed
+                    files, or `npx nx affected -t build --base=origin/<baseRef>`.
+           - Turbo: `npx turbo run build --filter=<project>`.
+         If you cannot identify a single affected project, SKIP the build step
+         (note "build skipped: monorepo root, no single affected project") and
+         rely on install + lint + test — do NOT run the full fan-out build.
+
+         TIME BUDGET (never hang): wrap build and test in a hard timeout so a
+         slow/non-terminating command returns control instead of stalling:
+           timeout 420 <build-cmd> 2>&1 | tee "$ARTIFACTS_DIR/build.log"
+         Exit code 124 means it timed out. Treat a build/test TIMEOUT as
+         failure_reason="build" (or "test") with preexisting="no" and a note
+         that it exceeded the time budget — escalate to review; never retry the
+         same long command.
          For Python with Poetry (pyproject.toml + poetry.lock), prefer:
            poetry install                          (install = the dep step)
            poetry run ruff check .                 (lint, if ruff is configured)
