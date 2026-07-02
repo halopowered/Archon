@@ -331,12 +331,20 @@ nodes:
         echo "──────── sub-result: ${sentinel:-UNKNOWN} ────────"
         echo "$sentinel" > "$ARTIFACTS_DIR/.last-sentinel"
         # Reclaim disk immediately: each sub-run leaves a git worktree carrying a
-        # node_modules / Poetry venv that the built-in isolation cleanup SKIPS
-        # (untracked files make it look "dirty"). On the small (7.8G) Fly rootfs
-        # these accumulate fast during a drain and fill the disk (ENOSPC).
-        # --force removes the worktree despite the untracked deps; the sub-run's
-        # ephemeral branch is local-only so deleting it is safe. Never fatal.
-        archon complete "$branch" --force >/dev/null 2>&1 || true
+        # node_modules / Poetry venv (~1.5-1.9G for this Nx monorepo) that the
+        # built-in isolation cleanup SKIPS (untracked deps look "dirty"). On the
+        # 7.8G Fly rootfs these accumulate and fill the disk (ENOSPC) mid-PR.
+        # `archon complete <branch>` proved unreliable here (its branch->worktree
+        # mapping doesn't resolve — worktrees register under a different repo path
+        # than the entrypoint clone), so reclaim by the EXACT worktree dir Archon
+        # creates: task-<branch with '/' replaced by '-'>. Removing the dir frees
+        # the space; a best-effort prune tidies the git metadata afterward.
+        local wt_name="task-${branch//\//-}"
+        rm -rf /.archon/workspaces/*/*/worktrees/archon/"$wt_name" 2>/dev/null \
+          && echo "  reclaimed worktree $wt_name"
+        find /.archon -maxdepth 8 -name .git -type d 2>/dev/null | while read -r g; do
+          git -C "$(dirname "$g")" worktree prune 2>/dev/null || true
+        done
       }
 
       # Track folders we've already run readiness for (string-based dedup).

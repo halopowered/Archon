@@ -42,6 +42,15 @@ cd "$CHECKOUT"
 gh label create "$LABEL" --repo "$REPO" --color FBCA04 \
   --description "Handled by the Archon dependabot pipeline" >/dev/null 2>&1 || true
 
+# Startup reclaim: a prior run killed mid-PR (e.g. by the memory watchdog, which
+# also kills the sweep + pipeline) can leave ~1.7G worktrees behind that no
+# post-PR cleanup ran on. Nothing is running at sweep start, so clear them all.
+rm -rf /.archon/workspaces/*/*/worktrees/archon/task-* 2>/dev/null \
+  && echo "startup: reclaimed leftover worktrees"
+find /.archon -maxdepth 8 -name .git -type d 2>/dev/null | while read -r g; do
+  git -C "$(dirname "$g")" worktree prune 2>/dev/null || true
+done
+
 echo "Sweeping $REPO for untagged Dependabot PRs (label gate: '$LABEL')..."
 processed=0
 while :; do
@@ -71,18 +80,20 @@ while :; do
   fi
 
   # Reclaim disk after every PR. Each pipeline run leaves worktrees (the
-  # top-level run plus any sub-run the pipeline's own `archon complete` missed),
-  # several carrying node_modules / Poetry venvs. The built-in isolation cleanup
-  # skips them (untracked deps look "dirty"), so on the small Fly rootfs a long
-  # drain fills the disk (ENOSPC). Force-remove every linked worktree of this
-  # checkout (NOT the main checkout itself) then prune the admin records.
-  git worktree list --porcelain 2>/dev/null \
-    | awk '/^worktree /{print $2}' \
-    | grep -F '/worktrees/' \
-    | while read -r wt; do
-        git worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt"
-      done
-  git worktree prune 2>/dev/null || true
+  # top-level run + sub-runs) carrying node_modules / Poetry venvs (~1.5-1.9G
+  # each for the Nx monorepo). The built-in isolation cleanup skips them
+  # (untracked deps look "dirty"), so on the 7.8G Fly rootfs a long drain fills
+  # the disk (ENOSPC). NOTE: Archon registers these worktrees under
+  # /.archon/workspaces/*/*/worktrees/archon — NOT under $CHECKOUT (the
+  # entrypoint clone), so a `git -C $CHECKOUT worktree remove` here is a no-op
+  # (the original bug that let them accumulate). The drain is serial, so between
+  # PRs nothing is running: just remove every task-* worktree dir at the real
+  # location and prune the metadata on all repos.
+  rm -rf /.archon/workspaces/*/*/worktrees/archon/task-* 2>/dev/null \
+    && echo "  reclaimed all worktrees"
+  find /.archon -maxdepth 8 -name .git -type d 2>/dev/null | while read -r g; do
+    git -C "$(dirname "$g")" worktree prune 2>/dev/null || true
+  done
 
   processed=$((processed + 1))
 done
