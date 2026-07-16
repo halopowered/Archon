@@ -16,10 +16,13 @@ description: |
   - Checks out the PR's head branch in the Archon worktree
   - Runs the canonical install / lint / build / test commands for the
     detected stack, capturing logs to $ARTIFACTS_DIR
-  - Routes on the combined (verify result, bump type) signal:
-      patch/minor/major + verify pass → approve and squash-merge
-      unparseable bump + verify pass  → comment requesting human review
-      verify fail                     → comment with error excerpt; DO NOT merge
+  - Routes on the verify result:
+      verify pass → approve and squash-merge (ANY bump: patch/minor/major,
+                    and "unknown" grouped/multi-package PRs — passing local
+                    verification is the gate, not the bump type)
+      verify fail → comment with error excerpt; DO NOT merge
+    (The bump type is now informational only — used to label the approval
+    comment. There is no verify-pass path that escalates to human review.)
 
   NOT for: Non-Dependabot PRs, pre-flight readiness checks (use
            readiness-check), bulk PR sweeps (use dependabot-fix-check).
@@ -310,7 +313,7 @@ nodes:
       required: [success, detected_stack, failure_reason, preexisting, summary, error_excerpt, command_log]
 
   # ── Step 7: Gate that combines verify result + bump type → action ─────
-  # Output: "MERGE" | "MAJOR_REVIEW" | "FAIL_COMMENT" | "ABORT"
+  # Output: "MERGE" | "FAIL_COMMENT" | "ABORT"
   - id: gate-action
     depends_on: [verify-build-test, extract-bump-type]
     bash: |
@@ -333,21 +336,20 @@ nodes:
 
       if [ "$EFFECTIVE_SUCCESS" = "no" ]; then
         echo "FAIL_COMMENT"
-      elif [ "$BUMP" = "patch" ] || [ "$BUMP" = "minor" ] || [ "$BUMP" = "major" ]; then
-        # Policy: auto-merge any bump — including major — once local
-        # verification (install + lint + build + test) passes. Required
-        # GitHub status checks are still enforced server-side at merge time.
+      elif [ "$BUMP" = "patch" ] || [ "$BUMP" = "minor" ] || [ "$BUMP" = "major" ] || [ "$BUMP" = "unknown" ]; then
+        # Policy: once local verification (install + lint + build + test) passes,
+        # auto-merge regardless of the parsed bump type — including major AND
+        # "unknown" (grouped / multi-package PRs whose title yields no single
+        # semver bump). Passing verification is the gate; required GitHub status
+        # checks are still enforced server-side at merge time. There is no
+        # verify-pass path that escalates to human review.
         echo "MERGE"
-      elif [ "$BUMP" = "unknown" ]; then
-        # Couldn't parse a semver bump from the title (e.g. a grouped /
-        # multi-package PR) → escalate to human review rather than guess.
-        echo "MAJOR_REVIEW"
       else
         echo "ABORT"
       fi
     timeout: 5000
 
-  # ── Step 8a: Patch/minor + verify pass → approve and merge ────────────
+  # ── Step 8a: Verify pass (any bump) → approve and merge ───────────────
   - id: approve-and-merge
     depends_on: [gate-action, fetch-pr, extract-bump-type, verify-build-test]
     when: "$gate-action.output == 'MERGE'"
@@ -361,11 +363,15 @@ nodes:
       STACK=$verify-build-test.output.detected_stack
       OWNER_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 
+      # Human-readable label — "unknown" means a grouped / multi-package PR.
+      BUMP_LABEL="$BUMP bump"
+      [ "$BUMP" = "unknown" ] && BUMP_LABEL="grouped/multi-package update"
+
       # Approve via REST. Tolerated on failure — a prior run may have
       # already submitted an approval, and GitHub may reject duplicates.
       gh api -X POST "repos/$OWNER_REPO/pulls/$PR_NUMBER/reviews" \
         -f event=APPROVE \
-        -f body="Auto-approved: Dependabot $BUMP bump — local $STACK verification (install/lint/build/test) all green." \
+        -f body="Auto-approved: Dependabot $BUMP_LABEL — local $STACK verification (install/lint/build/test) all green." \
         >/dev/null 2>&1 \
         || echo "  (approve failed — likely already approved by an earlier run; continuing)"
 
@@ -421,38 +427,9 @@ nodes:
         gh api -X DELETE "repos/$OWNER_REPO/git/refs/heads/$HEAD_REF" 2>/dev/null || true
       fi
 
-      echo "✅ PR #$PR_NUMBER: approved and squash-merged ($BUMP bump, verified locally)"
+      echo "✅ PR #$PR_NUMBER: approved and squash-merged ($BUMP_LABEL, verified locally)"
       echo "VERIFY_MERGED" > "$ARTIFACTS_DIR/status.txt"
     timeout: 90000
-
-  # ── Step 8b: Major (or unknown) bump + verify pass → comment ──────────
-  - id: comment-major-review
-    depends_on: [gate-action, fetch-pr, extract-bump-type, verify-build-test]
-    when: "$gate-action.output == 'MAJOR_REVIEW'"
-    bash: |
-      set -e
-      PR_NUMBER=$(jq -r '.number' "$ARTIFACTS_DIR/pr.json")
-      BUMP=$extract-bump-type.output
-      SUMMARY=$verify-build-test.output.summary
-      STACK=$verify-build-test.output.detected_stack
-      OWNER_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-
-      BODY="🔍 **Human review required.**
-
-      Couldn't determine the version-bump type from this PR's title (likely a
-      grouped or multi-package update), so it was not auto-merged. Local
-      verification ($STACK install/lint/build/test) passed:
-
-      > $SUMMARY
-
-      Please review and merge manually if the change looks safe."
-
-      gh api -X POST "repos/$OWNER_REPO/issues/$PR_NUMBER/comments" \
-        -f body="$BODY" >/dev/null
-
-      echo "💬 PR #$PR_NUMBER: posted human-review request (unparseable bump, verify passed)"
-      echo "VERIFY_MAJOR_REVIEW" > "$ARTIFACTS_DIR/status.txt"
-    timeout: 30000
 
   # ── Step 8c: Verify failed → comment with error excerpt, no merge ─────
   - id: comment-verify-failed
@@ -509,7 +486,6 @@ nodes:
       - report-pr-not-found
       - report-not-dependabot
       - approve-and-merge
-      - comment-major-review
       - comment-verify-failed
     trigger_rule: all_done
     bash: |
