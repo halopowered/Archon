@@ -53,31 +53,45 @@ done
 
 echo "Sweeping $REPO for untagged Dependabot PRs (label gate: '$LABEL')..."
 processed=0
+# PR numbers handled THIS run. GitHub's `gh pr list` is search-index-backed and
+# lags MINUTES behind a merge or a label add (unlike `gh pr view`, a direct
+# object read). Without this set, a PR the pipeline just merged keeps reappearing
+# in the untagged-open list and the sweep spins on it — re-running a full
+# pipeline (incl. a ~30s Claude classify) every iteration until the index catches
+# up. SEEN makes selection immune to that lag: never pick a number twice per run.
+declare -A SEEN
 while :; do
-  # Next OPEN Dependabot PR that lacks the processed label.
-  pr=$(gh pr list --repo "$REPO" --author app/dependabot --state open \
+  # All untagged open Dependabot PRs, highest-number first (matches prior order).
+  candidates=$(gh pr list --repo "$REPO" --author app/dependabot --state open \
          --json number,labels --limit 100 \
        | jq -r --arg L "$LABEL" \
-         '[.[] | select(any(.labels[]?; .name == $L) | not)] | .[0].number // empty')
+         '[.[] | select(any(.labels[]?; .name == $L) | not)] | sort_by(.number) | reverse | .[].number')
+
+  # First candidate not already handled this run (lag-proof).
+  pr=""
+  for n in $candidates; do
+    if [ -z "${SEEN[$n]:-}" ]; then pr="$n"; break; fi
+  done
 
   if [ -z "$pr" ]; then
-    echo "✅ $REPO: no untagged Dependabot PRs remain (processed $processed this run)."
+    echo "✅ $REPO: no unprocessed untagged Dependabot PRs remain (processed $processed this run)."
     break
   fi
+  SEEN[$pr]=1
 
   echo "──────── ▶ $REPO PR #$pr ────────"
   archon workflow run dependabot-pipeline "$pr" --from "$FROM_BRANCH" \
     || echo "  (run errored — continuing to next PR)"
 
-  # If the PR is still OPEN it wasn't auto-merged (escalated / failed) — tag it
-  # so the next iteration skips it. Merged/closed PRs drop out naturally.
+  # Tag REGARDLESS of final state (open/merged/closed). SEEN already prevents
+  # re-selection within this run; the label is the CROSS-run guard so a resumed
+  # sweep (fresh process, empty SEEN) also skips it — including during the window
+  # where the merge/label hasn't propagated to the list index yet. Tagging a
+  # merged PR is harmless and semantically accurate ("archon handled this").
   state=$(gh pr view "$pr" --repo "$REPO" --json state -q .state 2>/dev/null || echo UNKNOWN)
-  if [ "$state" = "OPEN" ]; then
-    gh pr edit "$pr" --repo "$REPO" --add-label "$LABEL" >/dev/null \
-      && echo "  PR #$pr still open → tagged '$LABEL'"
-  else
-    echo "  PR #$pr is $state"
-  fi
+  gh pr edit "$pr" --repo "$REPO" --add-label "$LABEL" >/dev/null 2>&1 \
+    && echo "  PR #$pr ($state) → tagged '$LABEL'" \
+    || echo "  PR #$pr ($state) — tag add skipped/failed"
 
   # Reclaim disk after every PR. Each pipeline run leaves worktrees (the
   # top-level run + sub-runs) carrying node_modules / Poetry venvs (~1.5-1.9G
