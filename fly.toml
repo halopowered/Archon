@@ -48,6 +48,16 @@ swap_size_mb = 3072
   # already filtered by the opened/reopened action allowlist, and the pipeline
   # never reopens PRs itself.
   WEBHOOK_ALLOW_SELF_REOPEN = '1'
+  # Self-heal auto-drain (deploy/webhook-host/auto-drain.sh). On every boot the
+  # entrypoint abandons orphaned runs from the previous (crashed) process
+  # generation, then continuously drains each WEBHOOK_TARGET_REPOS repo SERIALLY
+  # (one repo's builds at a time — concurrent drains repeatedly OOM'd/crashed the
+  # 4GB box). This replaces the hand-launched `nohup sweep-repo.sh` that never
+  # survived a restart, leaving the drain silently stopped + orphans piling up.
+  # Tag-based, so once a repo is drained subsequent passes are cheap; new
+  # Dependabot PRs get picked up on the next pass. Auto-MERGES safe bumps, so
+  # this is an explicit opt-in — unset it to stop auto-draining on boot.
+  WEBHOOK_AUTODRAIN = '1'
   # Git committer identity for the pipeline's commits (auto-fix-lint /
   # auto-fix-install branch commits). appuser has no ~/.gitconfig on Fly, so
   # `git commit` errored "Author identity unknown". git reads these env vars

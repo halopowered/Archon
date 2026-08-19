@@ -132,6 +132,14 @@ if [ -n "${GITHUB_WEBHOOK_SECRET:-}" ] && [ -d /app/deploy/webhook-host ]; then
           || echo "[archon] webhook-host: WARN clone of $repo failed (check GH_TOKEN scope/SSO)"
       fi
     done
+    # Self-heal auto-drain (gated on WEBHOOK_AUTODRAIN): abandon orphaned runs
+    # from the previous process generation, then continuously drain each target
+    # repo SERIALLY. Launched in the background so it survives every boot/crash-
+    # recovery — the sweeps were previously hand-launched and died on restart.
+    if [ -n "${WEBHOOK_AUTODRAIN:-}" ] && [ -f /app/deploy/webhook-host/auto-drain.sh ]; then
+      echo "[archon] webhook-host: WEBHOOK_AUTODRAIN set — launching self-heal auto-drain"
+      bash /app/deploy/webhook-host/auto-drain.sh &
+    fi
     echo "[archon] webhook-host: launching dispatcher on port ${WEBHOOK_HOST_PORT:-9000}"
     exec bun /app/deploy/webhook-host/host.ts
   ' &
